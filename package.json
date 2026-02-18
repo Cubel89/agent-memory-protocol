@@ -1,0 +1,41 @@
+{
+  "name": "agent-memory-protocol",
+  "version": "0.2.0",
+  "description": "MCP Server that gives AI agents persistent memory across sessions. Remembers experiences, learns from corrections, and adapts to user preferences.",
+  "main": "build/index.js",
+  "type": "module",
+  "bin": {
+    "agent-memory": "./build/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node build/index.js",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "mcp",
+    "ai",
+    "memory",
+    "agents",
+    "claude",
+    "llm",
+    "persistent-memory",
+    "model-context-protocol"
+  ],
+  "author": "cubel",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cubel89/agent-memory-protocol.git"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0",
+    "better-sqlite3": "^12.6.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.2.3",
+    "typescript": "^5.9.3"
+  }
+}
