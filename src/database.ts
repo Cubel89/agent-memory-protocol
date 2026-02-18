@@ -5,102 +5,116 @@ import { fileURLToPath } from "url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, "..", "data", "memory.db");
 
-const db = new Database(DB_PATH);
+// ── Database initialization ──────────────────────────────
 
-// WAL mode = mejor rendimiento para lecturas concurrentes
-db.pragma("journal_mode = WAL");
+export function initDatabase(dbPath?: string) {
+  const db = new Database(dbPath || DB_PATH);
 
-// ── Esquema ──────────────────────────────────────────────
+  // WAL mode = better performance for concurrent reads
+  if (dbPath !== ":memory:") {
+    db.pragma("journal_mode = WAL");
+  }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS experiences (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    type        TEXT NOT NULL,       -- 'experience' | 'correction' | 'insight'
-    context     TEXT,                -- qué estaba pasando
-    action      TEXT,                -- qué se hizo
-    result      TEXT,                -- qué pasó
-    success     INTEGER DEFAULT 1,   -- 1 = fue bien, 0 = falló
-    tags        TEXT DEFAULT '',     -- tags separados por coma
-    project     TEXT DEFAULT '',     -- proyecto relacionado
-    created_at  TEXT DEFAULT (datetime('now'))
-  );
+  // ── Schema ─────────────────────────────────────────────
 
-  CREATE TABLE IF NOT EXISTS patterns (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    description TEXT NOT NULL,
-    category    TEXT DEFAULT '',      -- 'error', 'success', 'workflow', etc.
-    frequency   INTEGER DEFAULT 1,
-    examples    TEXT DEFAULT '[]',    -- JSON array de ejemplos
-    last_seen   TEXT DEFAULT (datetime('now'))
-  );
-`);
-
-// ── Migración: preferences con scope ────────────────────
-// Si la tabla existe sin scope, migrarla. Si no existe, crearla nueva.
-
-const tableInfo = db.prepare(`PRAGMA table_info(preferences)`).all() as any[];
-const hasScope = tableInfo.some((col: any) => col.name === "scope");
-
-if (tableInfo.length === 0) {
-  // Tabla no existe, crearla con scope desde el inicio
   db.exec(`
-    CREATE TABLE preferences (
+    CREATE TABLE IF NOT EXISTS experiences (
       id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      key         TEXT NOT NULL,
-      value       TEXT NOT NULL,
-      confidence  REAL DEFAULT 0.5,
-      source      TEXT DEFAULT '',
-      scope       TEXT DEFAULT 'global',  -- 'global' o ruta del proyecto
-      updated_at  TEXT DEFAULT (datetime('now')),
-      UNIQUE(key, scope)
+      type        TEXT NOT NULL,       -- 'experience' | 'correction' | 'insight'
+      context     TEXT,                -- what was happening
+      action      TEXT,                -- what was done
+      result      TEXT,                -- what happened
+      success     INTEGER DEFAULT 1,   -- 1 = success, 0 = failure
+      tags        TEXT DEFAULT '',     -- comma-separated tags
+      project     TEXT DEFAULT '',     -- related project
+      created_at  TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS patterns (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      description TEXT NOT NULL,
+      category    TEXT DEFAULT '',      -- 'error', 'success', 'workflow', etc.
+      frequency   INTEGER DEFAULT 1,
+      examples    TEXT DEFAULT '[]',    -- JSON array of examples
+      last_seen   TEXT DEFAULT (datetime('now'))
     );
   `);
-} else if (!hasScope) {
-  // Tabla existe pero sin scope, migrar
+
+  // ── Migration: preferences with scope ───────────────────
+
+  const tableInfo = db.prepare(`PRAGMA table_info(preferences)`).all() as any[];
+  const hasScope = tableInfo.some((col: any) => col.name === "scope");
+
+  if (tableInfo.length === 0) {
+    db.exec(`
+      CREATE TABLE preferences (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        key         TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        confidence  REAL DEFAULT 0.5,
+        source      TEXT DEFAULT '',
+        scope       TEXT DEFAULT 'global',
+        updated_at  TEXT DEFAULT (datetime('now')),
+        UNIQUE(key, scope)
+      );
+    `);
+  } else if (!hasScope) {
+    db.exec(`
+      ALTER TABLE preferences ADD COLUMN scope TEXT DEFAULT 'global';
+    `);
+    db.exec(`
+      CREATE TABLE preferences_new (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        key         TEXT NOT NULL,
+        value       TEXT NOT NULL,
+        confidence  REAL DEFAULT 0.5,
+        source      TEXT DEFAULT '',
+        scope       TEXT DEFAULT 'global',
+        updated_at  TEXT DEFAULT (datetime('now')),
+        UNIQUE(key, scope)
+      );
+      INSERT INTO preferences_new (id, key, value, confidence, source, scope, updated_at)
+        SELECT id, key, value, confidence, source, COALESCE(scope, 'global'), updated_at FROM preferences;
+      DROP TABLE preferences;
+      ALTER TABLE preferences_new RENAME TO preferences;
+    `);
+  }
+
+  // ── FTS5: Full-text search ──────────────────────────────
+
   db.exec(`
-    ALTER TABLE preferences ADD COLUMN scope TEXT DEFAULT 'global';
-  `);
-  // Recrear el índice UNIQUE para incluir scope
-  // SQLite no permite modificar constraints, así que recreamos la tabla
-  db.exec(`
-    CREATE TABLE preferences_new (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      key         TEXT NOT NULL,
-      value       TEXT NOT NULL,
-      confidence  REAL DEFAULT 0.5,
-      source      TEXT DEFAULT '',
-      scope       TEXT DEFAULT 'global',
-      updated_at  TEXT DEFAULT (datetime('now')),
-      UNIQUE(key, scope)
+    CREATE VIRTUAL TABLE IF NOT EXISTS experiences_fts USING fts5(
+      context, action, result, tags,
+      content=experiences,
+      content_rowid=id
     );
-    INSERT INTO preferences_new (id, key, value, confidence, source, scope, updated_at)
-      SELECT id, key, value, confidence, source, COALESCE(scope, 'global'), updated_at FROM preferences;
-    DROP TABLE preferences;
-    ALTER TABLE preferences_new RENAME TO preferences;
+
+    CREATE TRIGGER IF NOT EXISTS experiences_ai AFTER INSERT ON experiences BEGIN
+      INSERT INTO experiences_fts(rowid, context, action, result, tags)
+      VALUES (new.id, new.context, new.action, new.result, new.tags);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS experiences_ad AFTER DELETE ON experiences BEGIN
+      INSERT INTO experiences_fts(experiences_fts, rowid, context, action, result, tags)
+      VALUES ('delete', old.id, old.context, old.action, old.result, old.tags);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS experiences_au AFTER UPDATE ON experiences BEGIN
+      INSERT INTO experiences_fts(experiences_fts, rowid, context, action, result, tags)
+      VALUES ('delete', old.id, old.context, old.action, old.result, old.tags);
+      INSERT INTO experiences_fts(rowid, context, action, result, tags)
+      VALUES (new.id, new.context, new.action, new.result, new.tags);
+    END;
   `);
+
+  return db;
 }
 
-// ── FTS5: Búsqueda de texto completo ────────────────────
+// ── Production instance ─────────────────────────────────
 
-db.exec(`
-  CREATE VIRTUAL TABLE IF NOT EXISTS experiences_fts USING fts5(
-    context, action, result, tags,
-    content=experiences,
-    content_rowid=id
-  );
+const db = initDatabase();
 
-  CREATE TRIGGER IF NOT EXISTS experiences_ai AFTER INSERT ON experiences BEGIN
-    INSERT INTO experiences_fts(rowid, context, action, result, tags)
-    VALUES (new.id, new.context, new.action, new.result, new.tags);
-  END;
-
-  CREATE TRIGGER IF NOT EXISTS experiences_ad AFTER DELETE ON experiences BEGIN
-    INSERT INTO experiences_fts(experiences_fts, rowid, context, action, result, tags)
-    VALUES ('delete', old.id, old.context, old.action, old.result, old.tags);
-  END;
-`);
-
-// ── Queries preparadas ──────────────────────────────────
+// ── Prepared queries ────────────────────────────────────
 
 export const insertExperience = db.prepare(`
   INSERT INTO experiences (type, context, action, result, success, tags, project)
@@ -108,18 +122,27 @@ export const insertExperience = db.prepare(`
 `);
 
 export const searchExperiences = db.prepare(`
-  SELECT e.* FROM experiences e
+  SELECT e.*,
+    bm25(experiences_fts) AS text_score,
+    (1.0 / (1.0 + julianday('now') - julianday(e.created_at))) AS recency_score,
+    CASE WHEN e.success = 1 THEN 1.0 ELSE 0.5 END AS success_score
+  FROM experiences e
   JOIN experiences_fts fts ON e.id = fts.rowid
   WHERE experiences_fts MATCH @query
-  ORDER BY rank
+  ORDER BY (bm25(experiences_fts) * -1.0) * 0.5 + recency_score * 0.3 + success_score * 0.2 DESC
   LIMIT @limit
 `);
 
 export const searchExperiencesByProject = db.prepare(`
-  SELECT e.* FROM experiences e
+  SELECT e.*,
+    bm25(experiences_fts) AS text_score,
+    (1.0 / (1.0 + julianday('now') - julianday(e.created_at))) AS recency_score,
+    CASE WHEN e.success = 1 THEN 1.0 ELSE 0.5 END AS success_score,
+    CASE WHEN e.project = @project THEN 0.1 ELSE 0.0 END AS project_bonus
+  FROM experiences e
   JOIN experiences_fts fts ON e.id = fts.rowid
   WHERE experiences_fts MATCH @query AND (e.project = @project OR e.project = '')
-  ORDER BY rank
+  ORDER BY (bm25(experiences_fts) * -1.0) * 0.5 + recency_score * 0.3 + success_score * 0.2 + project_bonus DESC
   LIMIT @limit
 `);
 
@@ -136,7 +159,7 @@ export const getExperiencesByType = db.prepare(`
   LIMIT @limit
 `);
 
-// ── Preferences con scope ───────────────────────────────
+// ── Preferences with scope ──────────────────────────────
 
 export const upsertPreference = db.prepare(`
   INSERT INTO preferences (key, value, confidence, source, scope)
@@ -148,26 +171,26 @@ export const upsertPreference = db.prepare(`
     updated_at = datetime('now')
 `);
 
-// Devuelve preferencias globales
+// Returns global preferences
 export const getGlobalPreferences = db.prepare(`
   SELECT * FROM preferences
   WHERE scope = 'global'
   ORDER BY confidence DESC
 `);
 
-// Devuelve preferencias de un proyecto específico
+// Returns preferences for a specific project
 export const getProjectPreferences = db.prepare(`
   SELECT * FROM preferences
   WHERE scope = @scope
   ORDER BY confidence DESC
 `);
 
-// Devuelve preferencias combinadas: proyecto + globales (proyecto tiene prioridad)
+// Returns merged preferences: project + global (project takes priority)
 export function getMergedPreferences(project: string) {
   const global = getGlobalPreferences.all() as any[];
   const projectPrefs = getProjectPreferences.all({ scope: project }) as any[];
 
-  // Proyecto sobreescribe global
+  // Project overrides global
   const merged = new Map<string, any>();
   for (const pref of global) {
     merged.set(pref.key, { ...pref, _origin: "global" });
@@ -210,6 +233,32 @@ export const getPatterns = db.prepare(`
   SELECT * FROM patterns
   ORDER BY frequency DESC
   LIMIT @limit
+`);
+
+// ── Delete experiences ─────────────────────────────────
+
+export const deleteExperienceById = db.prepare(`
+  DELETE FROM experiences WHERE id = @id
+`);
+
+export const deleteExperiencesByTag = db.prepare(`
+  DELETE FROM experiences WHERE tags LIKE '%' || @tag || '%'
+`);
+
+export const deleteExperiencesByProject = db.prepare(`
+  DELETE FROM experiences WHERE project = @project
+`);
+
+// ── Prune ──────────────────────────────────────────────
+
+export const pruneOldExperiences = db.prepare(`
+  DELETE FROM experiences
+  WHERE created_at < datetime('now', '-' || @days || ' days')
+    AND (@only_failures = 0 OR success = 0)
+`);
+
+export const pruneLowConfidencePreferences = db.prepare(`
+  DELETE FROM preferences WHERE confidence < @min_confidence
 `);
 
 // ── Stats ───────────────────────────────────────────────

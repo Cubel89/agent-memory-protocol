@@ -17,13 +17,18 @@ import {
   recordPattern,
   getPatterns,
   getStats,
+  deleteExperienceById,
+  deleteExperiencesByTag,
+  deleteExperiencesByProject,
+  pruneOldExperiences,
+  pruneLowConfidencePreferences,
 } from "./database.js";
 
-// ── Servidor MCP ────────────────────────────────────────
+// ── MCP Server ──────────────────────────────────────────
 
 const server = new McpServer({
   name: "agent-memory",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 // ════════════════════════════════════════════════════════
@@ -34,14 +39,14 @@ server.registerTool(
   "record_experience",
   {
     description:
-      "Guarda una experiencia en la memoria del agente. Usa esto para recordar qué funcionó, qué falló, y en qué contexto. Cada experiencia enriquece la memoria colectiva.",
+      "Save an experience to the agent's memory. Use this to remember what worked, what failed, and in what context. Each experience enriches the collective memory.",
     inputSchema: {
-      context: z.string().describe("Qué estaba pasando (el problema o situación)"),
-      action: z.string().describe("Qué se hizo para resolverlo"),
-      result: z.string().describe("Qué pasó después de la acción"),
-      success: z.boolean().describe("¿Funcionó? true/false"),
-      tags: z.string().optional().describe("Tags separados por coma (ej: 'typescript,bug,api')"),
-      project: z.string().optional().describe("Nombre o ruta del proyecto. Si se omite, se guarda como experiencia global."),
+      context: z.string().describe("What was happening (the problem or situation)"),
+      action: z.string().describe("What was done to resolve it"),
+      result: z.string().describe("What happened after the action"),
+      success: z.boolean().describe("Did it work? true/false"),
+      tags: z.string().optional().describe("Comma-separated tags (e.g. 'typescript,bug,api')"),
+      project: z.string().optional().describe("Project name or path. If omitted, saved as a global experience."),
     },
   },
   async ({ context, action, result, success, tags, project }) => {
@@ -60,7 +65,7 @@ server.registerTool(
       content: [
         {
           type: "text" as const,
-          text: `Experiencia guardada. Memoria: ${stats.experiences} experiencias, ${stats.patterns} patrones, ${stats.globalPrefs} prefs globales, ${stats.projectPrefs} prefs de proyecto.`,
+          text: `Experience saved. Memory: ${stats.experiences} experiences, ${stats.patterns} patterns, ${stats.globalPrefs} global prefs, ${stats.projectPrefs} project prefs.`,
         },
       ],
     };
@@ -75,13 +80,13 @@ server.registerTool(
   "record_correction",
   {
     description:
-      "Registra cuando el usuario te corrige o rechaza una acción. Esto es CRÍTICO para aprender sus preferencias. Úsalo cada vez que el usuario diga 'no', 'así no', 'mejor de otra forma', o rechace un tool call.",
+      "Record when the user corrects or rejects an action. This is CRITICAL for learning their preferences. Use it whenever the user says 'no', 'not like that', 'do it differently', or rejects a tool call.",
     inputSchema: {
-      what_i_did: z.string().describe("Lo que hiciste que fue incorrecto o rechazado"),
-      what_user_wanted: z.string().describe("Lo que el usuario realmente quería"),
-      lesson: z.string().describe("Lección aprendida: qué hacer diferente la próxima vez"),
-      tags: z.string().optional().describe("Tags para categorizar (ej: 'estilo,código,comunicación')"),
-      project: z.string().optional().describe("Proyecto donde ocurrió la corrección"),
+      what_i_did: z.string().describe("What you did that was incorrect or rejected"),
+      what_user_wanted: z.string().describe("What the user actually wanted"),
+      lesson: z.string().describe("Lesson learned: what to do differently next time"),
+      tags: z.string().optional().describe("Tags to categorize (e.g. 'style,code,communication')"),
+      project: z.string().optional().describe("Project where the correction happened"),
     },
   },
   async ({ what_i_did, what_user_wanted, lesson, tags, project }) => {
@@ -98,14 +103,14 @@ server.registerTool(
     recordPattern(
       lesson,
       "correction",
-      `Hice: ${what_i_did} → Quería: ${what_user_wanted}`
+      `Did: ${what_i_did} → Wanted: ${what_user_wanted}`
     );
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Corrección registrada y patrón actualizado. Lección: "${lesson}"`,
+          text: `Correction recorded and pattern updated. Lesson: "${lesson}"`,
         },
       ],
     };
@@ -114,23 +119,23 @@ server.registerTool(
 
 // ════════════════════════════════════════════════════════
 // TOOL 3: learn_preference
-// Ahora con scope: 'global' o nombre de proyecto
+// Supports scope: 'global' or project name
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "learn_preference",
   {
     description:
-      "Guarda o actualiza una preferencia del usuario. Soporta DOS niveles:\n" +
-      "- scope='global' (default): aplica a TODOS los proyectos\n" +
-      "- scope='nombre-proyecto': aplica SOLO a ese proyecto y sobreescribe la global\n\n" +
-      "Ejemplo: el usuario prefiere TypeScript globalmente, pero en un proyecto legacy usa JavaScript.\n" +
-      "Cada vez que se confirma la misma preferencia, su confianza sube.",
+      "Save or update a user preference. Supports TWO levels:\n" +
+      "- scope='global' (default): applies to ALL projects\n" +
+      "- scope='project-name': applies ONLY to that project and overrides the global\n\n" +
+      "Example: user prefers TypeScript globally, but uses JavaScript in a legacy project.\n" +
+      "Each time the same preference is confirmed, its confidence increases.",
     inputSchema: {
-      key: z.string().describe("Nombre de la preferencia (ej: 'idioma', 'estilo_codigo', 'framework')"),
-      value: z.string().describe("Valor de la preferencia (ej: 'español', 'funcional', 'react')"),
-      scope: z.string().optional().describe("'global' (default) o nombre/ruta del proyecto para preferencia específica"),
-      source: z.string().optional().describe("De dónde se aprendió (ej: 'el usuario lo dijo', 'inferido de corrección')"),
+      key: z.string().describe("Preference name (e.g. 'language', 'code_style', 'framework')"),
+      value: z.string().describe("Preference value (e.g. 'english', 'functional', 'react')"),
+      scope: z.string().optional().describe("'global' (default) or project name/path for project-specific preference"),
+      source: z.string().optional().describe("Where it was learned from (e.g. 'user said so', 'inferred from correction')"),
     },
   },
   async ({ key, value, scope, source }) => {
@@ -140,18 +145,18 @@ server.registerTool(
       key,
       value,
       confidence: 0.5,
-      source: source || "observado",
+      source: source || "observed",
       scope: effectiveScope,
     });
 
     const pref = getPreference.get({ key, scope: effectiveScope }) as any;
-    const scopeLabel = effectiveScope === "global" ? "GLOBAL" : `proyecto: ${effectiveScope}`;
+    const scopeLabel = effectiveScope === "global" ? "GLOBAL" : `project: ${effectiveScope}`;
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Preferencia "${key}" = "${value}" guardada [${scopeLabel}] (confianza: ${pref?.confidence || 0.5}).`,
+          text: `Preference "${key}" = "${value}" saved [${scopeLabel}] (confidence: ${pref?.confidence || 0.5}).`,
         },
       ],
     };
@@ -166,11 +171,11 @@ server.registerTool(
   "query_memory",
   {
     description:
-      "Busca en la memoria experiencias relevantes. ÚSALO ANTES de tomar decisiones importantes para ver si hay experiencias pasadas que apliquen. La búsqueda es por texto completo.",
+      "Search the memory for relevant experiences. USE THIS BEFORE making important decisions to check if past experiences apply. Full-text search.",
     inputSchema: {
-      query: z.string().describe("Qué buscar (texto libre, ej: 'error typescript imports')"),
-      project: z.string().optional().describe("Si se pasa, busca experiencias de ese proyecto + globales"),
-      limit: z.number().optional().describe("Máximo de resultados (default: 5)"),
+      query: z.string().describe("What to search for (free text, e.g. 'error typescript imports')"),
+      project: z.string().optional().describe("If provided, searches experiences from this project + global ones"),
+      limit: z.number().optional().describe("Maximum results (default: 5)"),
     },
   },
   async ({ query, project, limit }) => {
@@ -186,7 +191,7 @@ server.registerTool(
           content: [
             {
               type: "text" as const,
-              text: "No encontré experiencias relevantes en la memoria. Esto es territorio nuevo.",
+              text: "No relevant experiences found in memory. This is uncharted territory.",
             },
           ],
         };
@@ -195,7 +200,7 @@ server.registerTool(
       const formatted = results
         .map(
           (r: any, i: number) =>
-            `${i + 1}. [${r.type}] ${r.success ? "OK" : "FALLO"}${r.project ? ` (${r.project})` : ""} | ${r.context}\n   Acción: ${r.action}\n   Resultado: ${r.result}\n   Tags: ${r.tags} | ${r.created_at}`
+            `${i + 1}. [${r.type}] ${r.success ? "OK" : "FAIL"}${r.project ? ` (${r.project})` : ""} | ${r.context}\n   Action: ${r.action}\n   Result: ${r.result}\n   Tags: ${r.tags} | ${r.created_at}`
         )
         .join("\n\n");
 
@@ -203,7 +208,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Encontré ${results.length} experiencias relevantes:\n\n${formatted}`,
+            text: `Found ${results.length} relevant experiences:\n\n${formatted}`,
           },
         ],
       };
@@ -220,7 +225,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Búsqueda directa no disponible. Últimas ${recent.length} experiencias:\n\n${formatted}`,
+            text: `Direct search unavailable. Last ${recent.length} experiences:\n\n${formatted}`,
           },
         ],
       };
@@ -236,9 +241,9 @@ server.registerTool(
   "get_patterns",
   {
     description:
-      "Devuelve los patrones más frecuentes detectados. Útil para ver errores recurrentes, workflows que funcionan, y lecciones aprendidas repetidamente.",
+      "Returns the most frequent patterns detected. Useful for seeing recurring errors, successful workflows, and repeatedly learned lessons.",
     inputSchema: {
-      limit: z.number().optional().describe("Máximo de patrones (default: 10)"),
+      limit: z.number().optional().describe("Maximum patterns (default: 10)"),
     },
   },
   async ({ limit }) => {
@@ -249,7 +254,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: "Aún no hay patrones detectados. Se irán formando con el uso.",
+            text: "No patterns detected yet. They will form with usage.",
           },
         ],
       };
@@ -258,7 +263,7 @@ server.registerTool(
     const formatted = results
       .map(
         (p: any, i: number) =>
-          `${i + 1}. [×${p.frequency}] ${p.description}\n   Categoría: ${p.category} | Último: ${p.last_seen}`
+          `${i + 1}. [×${p.frequency}] ${p.description}\n   Category: ${p.category} | Last seen: ${p.last_seen}`
       )
       .join("\n\n");
 
@@ -266,7 +271,7 @@ server.registerTool(
       content: [
         {
           type: "text" as const,
-          text: `${results.length} patrones detectados:\n\n${formatted}`,
+          text: `${results.length} patterns detected:\n\n${formatted}`,
         },
       ],
     };
@@ -275,16 +280,16 @@ server.registerTool(
 
 // ════════════════════════════════════════════════════════
 // TOOL 6: get_preferences
-// Ahora con soporte de proyecto (merge global + proyecto)
+// With project support (merge global + project)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "get_preferences",
   {
     description:
-      "Devuelve las preferencias del usuario. Si pasas un proyecto, devuelve las globales + las de ese proyecto combinadas (las de proyecto tienen prioridad sobre las globales). Consulta esto al inicio de cada sesión.",
+      "Returns user preferences. If a project is provided, returns global + project-specific preferences combined (project takes priority over global). Check this at the start of each session.",
     inputSchema: {
-      project: z.string().optional().describe("Nombre/ruta del proyecto. Si se omite, solo devuelve las globales."),
+      project: z.string().optional().describe("Project name/path. If omitted, returns only global preferences."),
     },
   },
   async ({ project }) => {
@@ -297,7 +302,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: "Aún no hay preferencias guardadas. Se aprenderán con el uso.",
+            text: "No preferences saved yet. They will be learned with usage.",
           },
         ],
       };
@@ -307,12 +312,12 @@ server.registerTool(
       .map(
         (p: any) => {
           const origin = p._origin ? ` [${p._origin}]` : ` [${p.scope || "global"}]`;
-          return `- ${p.key}: "${p.value}" (confianza: ${p.confidence})${origin}`;
+          return `- ${p.key}: "${p.value}" (confidence: ${p.confidence})${origin}`;
         }
       )
       .join("\n");
 
-    const label = project ? `Preferencias para ${project} (global + proyecto)` : "Preferencias globales";
+    const label = project ? `Preferences for ${project} (global + project)` : "Global preferences";
 
     return {
       content: [
@@ -326,13 +331,132 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 7: memory_stats
+// TOOL 7: forget_memory
+// ════════════════════════════════════════════════════════
+
+server.registerTool(
+  "forget_memory",
+  {
+    description:
+      "Delete specific memories by id, tag, or project. Useful for cleaning up obsolete or incorrect experiences. Requires at least one parameter.",
+    inputSchema: {
+      id: z.number().optional().describe("ID of the experience to delete"),
+      tag: z.string().optional().describe("Delete all experiences containing this tag"),
+      project: z.string().optional().describe("Delete all experiences from this project"),
+    },
+  },
+  async ({ id, tag, project }) => {
+    if (!id && !tag && !project) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Error: you must provide at least one of: id, tag, or project.",
+          },
+        ],
+      };
+    }
+
+    let totalDeleted = 0;
+
+    if (id) {
+      const result = deleteExperienceById.run({ id });
+      totalDeleted += result.changes;
+    }
+
+    if (tag) {
+      const result = deleteExperiencesByTag.run({ tag });
+      totalDeleted += result.changes;
+    }
+
+    if (project) {
+      const result = deleteExperiencesByProject.run({ project });
+      totalDeleted += result.changes;
+    }
+
+    const stats = getStats();
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Deleted ${totalDeleted} experience(s). Remaining memory: ${stats.experiences} experiences, ${stats.patterns} patterns.`,
+        },
+      ],
+    };
+  }
+);
+
+// ════════════════════════════════════════════════════════
+// TOOL 8: prune_memory
+// ════════════════════════════════════════════════════════
+
+server.registerTool(
+  "prune_memory",
+  {
+    description:
+      "Automatic memory cleanup. Deletes old experiences (by days), failures only, or low-confidence preferences. Requires at least one parameter.",
+    inputSchema: {
+      older_than_days: z.number().optional().describe("Delete experiences older than N days"),
+      only_failures: z.boolean().optional().describe("If true, only delete failed experiences (default: false)"),
+      min_confidence: z.number().optional().describe("Delete preferences with confidence below this value"),
+    },
+  },
+  async ({ older_than_days, only_failures, min_confidence }) => {
+    if (!older_than_days && min_confidence === undefined) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: "Error: you must provide at least older_than_days or min_confidence.",
+          },
+        ],
+      };
+    }
+
+    let deletedExperiences = 0;
+    let deletedPreferences = 0;
+
+    if (older_than_days) {
+      const result = pruneOldExperiences.run({
+        days: older_than_days,
+        only_failures: only_failures ? 1 : 0,
+      });
+      deletedExperiences = result.changes;
+    }
+
+    if (min_confidence !== undefined) {
+      const result = pruneLowConfidencePreferences.run({ min_confidence });
+      deletedPreferences = result.changes;
+    }
+
+    const stats = getStats();
+    const parts: string[] = [];
+    if (deletedExperiences > 0) parts.push(`${deletedExperiences} experience(s)`);
+    if (deletedPreferences > 0) parts.push(`${deletedPreferences} preference(s)`);
+
+    const summary = parts.length > 0
+      ? `Deleted ${parts.join(" and ")}.`
+      : "No records matched the criteria.";
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `${summary} Remaining memory: ${stats.experiences} experiences, ${stats.globalPrefs} global prefs, ${stats.projectPrefs} project prefs.`,
+        },
+      ],
+    };
+  }
+);
+
+// ════════════════════════════════════════════════════════
+// TOOL 9: memory_stats
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "memory_stats",
   {
-    description: "Muestra estadísticas de la memoria: experiencias, correcciones, preferencias globales/proyecto y patrones.",
+    description: "Shows memory statistics: experiences, corrections, global/project preferences, and patterns.",
     inputSchema: {},
   },
   async () => {
@@ -340,22 +464,22 @@ server.registerTool(
     const corrections = getExperiencesByType.all({ type: "correction", limit: 3 }) as any[];
     const topPatterns = getPatterns.all({ limit: 3 }) as any[];
 
-    let text = `=== Estado de la Memoria ===
-Experiencias:       ${stats.experiences}
-Correcciones:       ${stats.corrections}
-Prefs globales:     ${stats.globalPrefs}
-Prefs de proyecto:  ${stats.projectPrefs}
-Patrones:           ${stats.patterns}`;
+    let text = `=== Memory Status ===
+Experiences:        ${stats.experiences}
+Corrections:        ${stats.corrections}
+Global prefs:       ${stats.globalPrefs}
+Project prefs:      ${stats.projectPrefs}
+Patterns:           ${stats.patterns}`;
 
     if (corrections.length > 0) {
-      text += `\n\nÚltimas correcciones:`;
+      text += `\n\nLatest corrections:`;
       corrections.forEach((c: any) => {
         text += `\n- ${c.result}`;
       });
     }
 
     if (topPatterns.length > 0) {
-      text += `\n\nPatrones top:`;
+      text += `\n\nTop patterns:`;
       topPatterns.forEach((p: any) => {
         text += `\n- [×${p.frequency}] ${p.description}`;
       });
@@ -367,12 +491,12 @@ Patrones:           ${stats.patterns}`;
   }
 );
 
-// ── Arrancar el servidor ────────────────────────────────
+// ── Start the server ────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Agent Memory MCP Server v0.2.0 running on stdio");
+  console.error("Agent Memory MCP Server v0.3.0 running on stdio");
 }
 
 main().catch((error) => {
