@@ -1,5 +1,7 @@
 # Agent Memory Protocol
 
+[Leer en Español](README_ES.md)
+
 **Give your AI agents persistent memory across sessions.**
 
 An MCP (Model Context Protocol) server that lets AI agents remember experiences, learn from corrections, and adapt to your preferences. Works with Claude Code, Codex CLI, Gemini CLI, and any MCP-compatible client.
