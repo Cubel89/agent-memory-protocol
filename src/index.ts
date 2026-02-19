@@ -22,6 +22,7 @@ import {
   deleteExperiencesByProject,
   pruneOldExperiences,
   pruneLowConfidencePreferences,
+  checkpoint,
 } from "./database.js";
 
 // ── MCP Server ──────────────────────────────────────────
@@ -59,6 +60,7 @@ server.registerTool(
       tags: tags || "",
       project: project || "",
     });
+    checkpoint();
 
     const stats = getStats();
     return {
@@ -105,6 +107,7 @@ server.registerTool(
       "correction",
       `Did: ${what_i_did} → Wanted: ${what_user_wanted}`
     );
+    checkpoint();
 
     return {
       content: [
@@ -148,6 +151,7 @@ server.registerTool(
       source: source || "observed",
       scope: effectiveScope,
     });
+    checkpoint();
 
     const pref = getPreference.get({ key, scope: effectiveScope }) as any;
     const scopeLabel = effectiveScope === "global" ? "GLOBAL" : `project: ${effectiveScope}`;
@@ -374,6 +378,8 @@ server.registerTool(
       totalDeleted += result.changes;
     }
 
+    if (totalDeleted > 0) checkpoint();
+
     const stats = getStats();
     return {
       content: [
@@ -428,6 +434,8 @@ server.registerTool(
       const result = pruneLowConfidencePreferences.run({ min_confidence });
       deletedPreferences = result.changes;
     }
+
+    if (deletedExperiences > 0 || deletedPreferences > 0) checkpoint();
 
     const stats = getStats();
     const parts: string[] = [];

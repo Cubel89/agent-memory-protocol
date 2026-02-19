@@ -273,4 +273,12 @@ export const getStats = () => {
   return { experiences, corrections, globalPrefs, projectPrefs, patterns };
 };
 
+// ── WAL Checkpoint ──────────────────────────────────────
+// Consolida el WAL en el .db principal para que los backups
+// copien siempre datos completos y no se pierdan escrituras
+// si el proceso muere sin cierre limpio.
+export function checkpoint() {
+  db.pragma("wal_checkpoint(TRUNCATE)");
+}
+
 export default db;
