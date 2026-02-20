@@ -130,6 +130,32 @@ Cuando resuelvas algo complejo:
 - Usar `record_experience` para que futuras sesiones se beneficien
 ```
 
+## Sobrevivir a la compactacion de contexto
+
+Todos los CLIs de codificacion con IA tienen una funcion de compactacion o compresion que resume la conversacion para ahorrar tokens. Cuando esto ocurre, **las preferencias cargadas al inicio de la sesion pueden perderse** del contexto de trabajo del agente.
+
+Como el archivo de instrucciones globales (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) siempre se recarga con cada peticion — incluso despues de compactar — la solucion es añadir ahi una instruccion de recarga.
+
+Añade lo siguiente al mismo archivo de instrucciones donde configuraste la carga automatica:
+
+```markdown
+## Recuperacion de memoria tras compactacion
+
+Despues de cualquier compactacion de contexto (`/compact`, `/compress`, o automatica), SIEMPRE:
+1. Llamar a `get_preferences` con el nombre del proyecto actual para recargar preferencias
+2. Re-aplicar esas preferencias antes de continuar trabajando
+```
+
+### Como lo maneja cada CLI
+
+| CLI | Comando de compactacion | Archivo de instrucciones | ¿Sobrevive a la compactacion? |
+|---|---|---|---|
+| Claude Code | `/compact` | `CLAUDE.md` / `MEMORY.md` | Si — siempre en el system prompt |
+| Codex CLI | `/compact` | `AGENTS.md` | Si — se envia con cada peticion |
+| Gemini CLI | `/compress` | `GEMINI.md` | Si — se carga como system instruction |
+
+> **Nota:** Ninguno de los CLIs ofrece actualmente hooks o eventos para acciones post-compactacion. El enfoque basado en instrucciones es el unico metodo fiable en las tres plataformas.
+
 ## Tools disponibles
 
 Una vez conectado, el agente obtiene estas herramientas:

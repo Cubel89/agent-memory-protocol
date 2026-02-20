@@ -132,6 +132,32 @@ When you solve something complex:
 - Use `record_experience` so future sessions can benefit
 ```
 
+## Surviving context compaction
+
+All AI coding CLIs have a compaction or compression feature that summarizes the conversation to save tokens. When this happens, **preferences loaded at the start of the session can be lost** from the agent's working context.
+
+Since the global instructions file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) is always reloaded with every request — even after compaction — the solution is to add a reload instruction there.
+
+Add the following to the same instructions file where you configured auto-load:
+
+```markdown
+## Memory recovery after compaction
+
+After any context compaction (`/compact`, `/compress`, or automatic), ALWAYS:
+1. Call `get_preferences` with the current project name to reload preferences
+2. Re-apply those preferences before continuing work
+```
+
+### How each CLI handles it
+
+| CLI | Compaction command | Instructions file | Survives compaction? |
+|---|---|---|---|
+| Claude Code | `/compact` | `CLAUDE.md` / `MEMORY.md` | Yes — always in system prompt |
+| Codex CLI | `/compact` | `AGENTS.md` | Yes — sent with every request |
+| Gemini CLI | `/compress` | `GEMINI.md` | Yes — loaded as system instruction |
+
+> **Note:** None of the CLIs currently offer hooks or events for post-compaction actions. The instruction-based approach is the only reliable method across all three platforms.
+
 ## Tools available
 
 Once connected, the agent gets these tools:
