@@ -10,8 +10,13 @@ Un servidor MCP (Model Context Protocol) que permite a los agentes de IA recorda
 - **Aprende de correcciones** — Cada vez que corriges al agente, registra la leccion
 - **Se adapta a preferencias** — Detecta patrones en como trabajas y los recuerda
 - **Memoria con alcance** — Preferencias globales + overrides por proyecto
-- **Busqueda de texto completo** — Encuentra experiencias pasadas relevantes al instante
+- **Busqueda de texto completo** — Encuentra experiencias pasadas relevantes al instante (progressive disclosure: compacto → timeline → detalle completo)
 - **Deteccion de patrones** — Identifica errores recurrentes y workflows exitosos
+- **Deduplicacion automatica** — Hash SHA-256 con ventana de 15 minutos evita entradas duplicadas
+- **Topic upserts** — Los temas recurrentes se actualizan en lugar de crear duplicados
+- **Decay de confianza** — Las preferencias pierden confianza con el tiempo si no se re-confirman
+- **Soft delete** — Las memorias eliminadas pueden recuperarse (marcadas, no destruidas)
+- **Hooks de Claude Code** — Inyecta contexto automaticamente al inicio, captura acciones, resume sesiones
 - **Gestion de memoria** — Olvida memorias especificas o limpia datos obsoletos automaticamente
 
 ## Inicio rapido
@@ -178,7 +183,29 @@ Como el archivo de instrucciones globales (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`
 | Codex CLI | `/compact` | `AGENTS.md` | Si — se envia con cada peticion |
 | Gemini CLI | `/compress` | `GEMINI.md` | Si — se carga como system instruction |
 
-> **Nota:** Ninguno de los CLIs ofrece actualmente hooks o eventos para acciones post-compactacion. El enfoque basado en instrucciones es el unico metodo fiable en las tres plataformas.
+> **Nota:** Claude Code soporta hooks (ver seccion "Hooks de Claude Code" arriba) que automatizan la recuperacion de contexto tras compactacion. Para Codex y Gemini, el enfoque basado en instrucciones es el unico metodo fiable.
+
+## Hooks de Claude Code
+
+v1.0.0 incluye hooks que automatizan el uso de la memoria en Claude Code. Instalalos copiando el directorio `hooks/` y configurando `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "matcher": "startup|resume|compact|clear", "hooks": [{ "type": "command", "command": "~/.agent-memory-protocol/hooks/session-start.sh", "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "~/.agent-memory-protocol/hooks/post-tool-use.sh", "async": true, "timeout": 5 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "~/.agent-memory-protocol/hooks/session-end.sh", "timeout": 5 }] }]
+  }
+}
+```
+
+| Hook | Cuando | Que hace |
+|---|---|---|
+| `session-start.sh` | La sesion arranca o se compacta | Inyecta preferencias, experiencias recientes, patrones y correcciones como contexto |
+| `post-tool-use.sh` | Despues de Write/Edit/Bash | Captura acciones automaticamente sin llamadas manuales |
+| `session-end.sh` | La sesion termina | Guarda un resumen de la sesion |
+
+**Requisitos:** `jq` y `sqlite3` CLI (ambos incluidos en macOS).
 
 ## Tools disponibles
 
@@ -186,14 +213,16 @@ Una vez conectado, el agente obtiene estas herramientas:
 
 | Tool | Que hace |
 |---|---|
-| `record_experience` | Guardar lo que se hizo, el resultado y el contexto |
+| `record_experience` | Guardar lo que se hizo, el resultado y el contexto. Soporta `topic_key` para upserts |
 | `record_correction` | Aprender de correcciones del usuario (compilador de intenciones) |
-| `learn_preference` | Almacenar preferencias con alcance global o de proyecto |
-| `query_memory` | Buscar experiencias pasadas por texto completo |
+| `learn_preference` | Almacenar preferencias con alcance global o de proyecto (confianza inicia en 0.3, decae con el tiempo) |
+| `query_memory` | Buscar experiencias pasadas — devuelve resultados compactos (usar `get_experience` para detalle completo) |
+| `get_experience` | Obtener detalle completo de una experiencia por ID |
+| `get_timeline` | Obtener contexto cronologico alrededor de una experiencia |
 | `get_patterns` | Ver patrones recurrentes (errores, exitos) |
-| `get_preferences` | Listar preferencias aprendidas (merge global + proyecto) |
+| `get_preferences` | Listar preferencias con confianza efectiva (merge global + proyecto) |
 | `memory_stats` | Dashboard con estadisticas de la memoria |
-| `forget_memory` | Eliminar memorias especificas por id, tag o proyecto |
+| `forget_memory` | Soft-delete de memorias especificas por id, tag o proyecto |
 | `prune_memory` | Limpiar datos antiguos, fallidos o de baja confianza |
 
 ### forget_memory
@@ -206,7 +235,7 @@ Elimina memorias especificas de la base de datos. Requiere al menos un parametro
 | `tag` | string (opcional) | Eliminar todas las experiencias que coincidan con un tag |
 | `project` | string (opcional) | Eliminar todas las experiencias de un proyecto |
 
-Devuelve el numero de registros eliminados.
+Devuelve el numero de registros soft-deleted (pueden recuperarse).
 
 ### prune_memory
 

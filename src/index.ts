@@ -5,21 +5,26 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 
 import {
-  insertExperience,
+  insertOrDeduplicate,
   searchExperiences,
   searchExperiencesByProject,
+  searchExperiencesCompact,
+  searchExperiencesCompactByProject,
+  getExperienceById,
+  getExperienceTimeline,
   getRecentExperiences,
   getExperiencesByType,
   upsertPreference,
   getGlobalPreferences,
   getMergedPreferences,
   getPreference,
+  applyDecay,
   recordPattern,
   getPatterns,
   getStats,
-  deleteExperienceById,
-  deleteExperiencesByTag,
-  deleteExperiencesByProject,
+  softDeleteExperienceById,
+  softDeleteExperiencesByTag,
+  softDeleteExperiencesByProject,
   pruneOldExperiences,
   pruneLowConfidencePreferences,
   checkpoint,
@@ -29,7 +34,7 @@ import {
 
 const server = new McpServer({
   name: "agent-memory",
-  version: "0.3.0",
+  version: "1.0.0",
 });
 
 // ════════════════════════════════════════════════════════
@@ -48,10 +53,11 @@ server.registerTool(
       success: z.boolean().describe("Did it work? true/false"),
       tags: z.string().optional().describe("Comma-separated tags (e.g. 'typescript,bug,api')"),
       project: z.string().optional().describe("Project name or path. If omitted, saved as a global experience."),
+      topic_key: z.string().optional().describe("A unique topic identifier (e.g. 'arch:database-schema', 'config:tsconfig'). If provided, updates the existing experience with the same topic_key+project instead of creating a new one. Use this for knowledge that evolves over time (architecture decisions, configurations, project conventions)."),
     },
   },
-  async ({ context, action, result, success, tags, project }) => {
-    insertExperience.run({
+  async ({ context, action, result, success, tags, project, topic_key }) => {
+    const { id, deduplicated, upserted } = insertOrDeduplicate({
       type: "experience",
       context,
       action,
@@ -59,15 +65,20 @@ server.registerTool(
       success: success ? 1 : 0,
       tags: tags || "",
       project: project || "",
+      topic_key,
     });
     checkpoint();
 
     const stats = getStats();
+    let status = "saved";
+    if (deduplicated) status = "deduplicated (existing updated)";
+    if (upserted) status = "upserted (topic updated)";
+
     return {
       content: [
         {
           type: "text" as const,
-          text: `Experience saved. Memory: ${stats.experiences} experiences, ${stats.patterns} patterns, ${stats.globalPrefs} global prefs, ${stats.projectPrefs} project prefs.`,
+          text: `Experience ${status} (id: ${id}). Memory: ${stats.experiences} experiences, ${stats.patterns} patterns, ${stats.globalPrefs} global prefs, ${stats.projectPrefs} project prefs.`,
         },
       ],
     };
@@ -92,7 +103,7 @@ server.registerTool(
     },
   },
   async ({ what_i_did, what_user_wanted, lesson, tags, project }) => {
-    insertExperience.run({
+    const { id, deduplicated } = insertOrDeduplicate({
       type: "correction",
       context: what_i_did,
       action: what_user_wanted,
@@ -109,11 +120,12 @@ server.registerTool(
     );
     checkpoint();
 
+    const status = deduplicated ? " (deduplicated)" : "";
     return {
       content: [
         {
           type: "text" as const,
-          text: `Correction recorded and pattern updated. Lesson: "${lesson}"`,
+          text: `Correction recorded${status} (id: ${id}) and pattern updated. Lesson: "${lesson}"`,
         },
       ],
     };
@@ -122,7 +134,7 @@ server.registerTool(
 
 // ════════════════════════════════════════════════════════
 // TOOL 3: learn_preference
-// Supports scope: 'global' or project name
+// Phase 6: Base confidence 0.3, decay tracking
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
@@ -147,20 +159,21 @@ server.registerTool(
     upsertPreference.run({
       key,
       value,
-      confidence: 0.5,
+      confidence: 0.3,
       source: source || "observed",
       scope: effectiveScope,
     });
     checkpoint();
 
     const pref = getPreference.get({ key, scope: effectiveScope }) as any;
+    const withDecay = applyDecay(pref);
     const scopeLabel = effectiveScope === "global" ? "GLOBAL" : `project: ${effectiveScope}`;
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `Preference "${key}" = "${value}" saved [${scopeLabel}] (confidence: ${pref?.confidence || 0.5}).`,
+          text: `Preference "${key}" = "${value}" saved [${scopeLabel}] (confidence: ${pref?.confidence || 0.3}, effective: ${withDecay.effective_confidence}).`,
         },
       ],
     };
@@ -169,6 +182,7 @@ server.registerTool(
 
 // ════════════════════════════════════════════════════════
 // TOOL 4: query_memory
+// Phase 5: Returns compact format by default
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
@@ -186,9 +200,10 @@ server.registerTool(
     const maxResults = limit || 5;
 
     try {
+      // Phase 5: compact format by default
       const results = project
-        ? searchExperiencesByProject.all({ query, project, limit: maxResults }) as any[]
-        : searchExperiences.all({ query, limit: maxResults }) as any[];
+        ? searchExperiencesCompactByProject.all({ query, project, limit: maxResults }) as any[]
+        : searchExperiencesCompact.all({ query, limit: maxResults }) as any[];
 
       if (results.length === 0) {
         return {
@@ -204,7 +219,7 @@ server.registerTool(
       const formatted = results
         .map(
           (r: any, i: number) =>
-            `${i + 1}. [${r.type}] ${r.success ? "OK" : "FAIL"}${r.project ? ` (${r.project})` : ""} | ${r.context}\n   Action: ${r.action}\n   Result: ${r.result}\n   Tags: ${r.tags} | ${r.created_at}`
+            `${i + 1}. [id:${r.id}] [${r.type}] ${r.success ? "OK" : "FAIL"}${r.project ? ` (${r.project})` : ""} | ${r.snippet}${r.snippet && r.snippet.length >= 120 ? "..." : ""}\n   Tags: ${r.tags} | ${r.created_at}${r.duplicate_count > 1 ? ` | x${r.duplicate_count} dups` : ""}${r.revision_count > 1 ? ` | rev ${r.revision_count}` : ""}`
         )
         .join("\n\n");
 
@@ -212,7 +227,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Found ${results.length} relevant experiences:\n\n${formatted}`,
+            text: `Found ${results.length} relevant experiences (compact):\n\n${formatted}\n\nUse get_experience(id) for full details.`,
           },
         ],
       };
@@ -221,7 +236,7 @@ server.registerTool(
       const formatted = recent
         .map(
           (r: any, i: number) =>
-            `${i + 1}. [${r.type}] ${r.context} → ${r.result}`
+            `${i + 1}. [id:${r.id}] [${r.type}] ${r.context} → ${r.result}`
         )
         .join("\n");
 
@@ -267,7 +282,7 @@ server.registerTool(
     const formatted = results
       .map(
         (p: any, i: number) =>
-          `${i + 1}. [×${p.frequency}] ${p.description}\n   Category: ${p.category} | Last seen: ${p.last_seen}`
+          `${i + 1}. [x${p.frequency}] ${p.description}\n   Category: ${p.category} | Last seen: ${p.last_seen}`
       )
       .join("\n\n");
 
@@ -284,7 +299,7 @@ server.registerTool(
 
 // ════════════════════════════════════════════════════════
 // TOOL 6: get_preferences
-// With project support (merge global + project)
+// Phase 6: Shows effective_confidence with decay
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
@@ -299,7 +314,7 @@ server.registerTool(
   async ({ project }) => {
     const results = project
       ? getMergedPreferences(project)
-      : getGlobalPreferences.all() as any[];
+      : (getGlobalPreferences.all() as any[]).map(applyDecay);
 
     if (results.length === 0) {
       return {
@@ -316,7 +331,7 @@ server.registerTool(
       .map(
         (p: any) => {
           const origin = p._origin ? ` [${p._origin}]` : ` [${p.scope || "global"}]`;
-          return `- ${p.key}: "${p.value}" (confidence: ${p.confidence})${origin}`;
+          return `- ${p.key}: "${p.value}" (confidence: ${p.confidence}, effective: ${p.effective_confidence}, decay: ${p.decay_factor})${origin}`;
         }
       )
       .join("\n");
@@ -335,7 +350,7 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 7: forget_memory
+// TOOL 7: forget_memory (Phase 1: soft delete)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
@@ -364,17 +379,17 @@ server.registerTool(
     let totalDeleted = 0;
 
     if (id) {
-      const result = deleteExperienceById.run({ id });
+      const result = softDeleteExperienceById.run({ id });
       totalDeleted += result.changes;
     }
 
     if (tag) {
-      const result = deleteExperiencesByTag.run({ tag });
+      const result = softDeleteExperiencesByTag.run({ tag });
       totalDeleted += result.changes;
     }
 
     if (project) {
-      const result = deleteExperiencesByProject.run({ project });
+      const result = softDeleteExperiencesByProject.run({ project });
       totalDeleted += result.changes;
     }
 
@@ -385,7 +400,7 @@ server.registerTool(
       content: [
         {
           type: "text" as const,
-          text: `Deleted ${totalDeleted} experience(s). Remaining memory: ${stats.experiences} experiences, ${stats.patterns} patterns.`,
+          text: `Soft-deleted ${totalDeleted} experience(s). Active memory: ${stats.experiences} experiences, ${stats.softDeleted} soft-deleted, ${stats.patterns} patterns.`,
         },
       ],
     };
@@ -393,7 +408,7 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 8: prune_memory
+// TOOL 8: prune_memory (Phase 1: soft delete)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
@@ -443,14 +458,14 @@ server.registerTool(
     if (deletedPreferences > 0) parts.push(`${deletedPreferences} preference(s)`);
 
     const summary = parts.length > 0
-      ? `Deleted ${parts.join(" and ")}.`
+      ? `Pruned ${parts.join(" and ")}.`
       : "No records matched the criteria.";
 
     return {
       content: [
         {
           type: "text" as const,
-          text: `${summary} Remaining memory: ${stats.experiences} experiences, ${stats.globalPrefs} global prefs, ${stats.projectPrefs} project prefs.`,
+          text: `${summary} Active memory: ${stats.experiences} experiences, ${stats.softDeleted} soft-deleted, ${stats.globalPrefs} global prefs, ${stats.projectPrefs} project prefs.`,
         },
       ],
     };
@@ -458,7 +473,7 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 9: memory_stats
+// TOOL 9: memory_stats (Phase 1: includes soft-deleted)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
@@ -475,6 +490,7 @@ server.registerTool(
     let text = `=== Memory Status ===
 Experiences:        ${stats.experiences}
 Corrections:        ${stats.corrections}
+Soft-deleted:       ${stats.softDeleted}
 Global prefs:       ${stats.globalPrefs}
 Project prefs:      ${stats.projectPrefs}
 Patterns:           ${stats.patterns}`;
@@ -489,7 +505,7 @@ Patterns:           ${stats.patterns}`;
     if (topPatterns.length > 0) {
       text += `\n\nTop patterns:`;
       topPatterns.forEach((p: any) => {
-        text += `\n- [×${p.frequency}] ${p.description}`;
+        text += `\n- [x${p.frequency}] ${p.description}`;
       });
     }
 
@@ -499,12 +515,106 @@ Patterns:           ${stats.patterns}`;
   }
 );
 
+// ════════════════════════════════════════════════════════
+// TOOL 10: get_experience (Phase 5: Progressive Disclosure)
+// ════════════════════════════════════════════════════════
+
+server.registerTool(
+  "get_experience",
+  {
+    description:
+      "Get full details of a specific experience by ID. Use this after query_memory returns compact results to drill into a specific experience.",
+    inputSchema: {
+      id: z.number().describe("The experience ID to retrieve"),
+    },
+  },
+  async ({ id }) => {
+    const exp = getExperienceById.get({ id }) as any;
+
+    if (!exp) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Experience #${id} not found (may have been deleted).`,
+          },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `=== Experience #${exp.id} ===
+Type:       ${exp.type}
+Success:    ${exp.success ? "Yes" : "No"}
+Project:    ${exp.project || "(global)"}
+Tags:       ${exp.tags || "(none)"}
+Created:    ${exp.created_at}
+${exp.topic_key ? `Topic:      ${exp.topic_key}\n` : ""}${exp.revision_count > 1 ? `Revisions:  ${exp.revision_count}\n` : ""}${exp.duplicate_count > 1 ? `Duplicates: ${exp.duplicate_count}\n` : ""}
+Context:    ${exp.context}
+Action:     ${exp.action}
+Result:     ${exp.result}`,
+        },
+      ],
+    };
+  }
+);
+
+// ════════════════════════════════════════════════════════
+// TOOL 11: get_timeline (Phase 5: Progressive Disclosure)
+// ════════════════════════════════════════════════════════
+
+server.registerTool(
+  "get_timeline",
+  {
+    description:
+      "Get chronological context around a specific experience. Shows what happened before and after within a 1-hour window. Useful for understanding the sequence of events.",
+    inputSchema: {
+      id: z.number().describe("The experience ID to get timeline around"),
+    },
+  },
+  async ({ id }) => {
+    const results = getExperienceTimeline.all({ id }) as any[];
+
+    if (results.length === 0) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `No timeline found for experience #${id} (may have been deleted).`,
+          },
+        ],
+      };
+    }
+
+    const formatted = results
+      .map(
+        (r: any) => {
+          const marker = r.id === id ? " <<<" : "";
+          return `[${r.created_at}] #${r.id} [${r.type}] ${r.success ? "OK" : "FAIL"} | ${r.snippet}${marker}`;
+        }
+      )
+      .join("\n");
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `Timeline around experience #${id} (+-1 hour):\n\n${formatted}`,
+        },
+      ],
+    };
+  }
+);
+
 // ── Start the server ────────────────────────────────────
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Agent Memory MCP Server v0.3.0 running on stdio");
+  console.error("Agent Memory MCP Server v1.0.0 running on stdio");
 }
 
 main().catch((error) => {

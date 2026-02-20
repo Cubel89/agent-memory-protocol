@@ -12,8 +12,13 @@ An MCP (Model Context Protocol) server that lets AI agents remember experiences,
 - **Learns from corrections** — Every time you correct the agent, it records the lesson
 - **Adapts to preferences** — Detects patterns in how you work and remembers them
 - **Scoped memory** — Global preferences + project-specific overrides
-- **Full-text search** — Find relevant past experiences instantly
+- **Full-text search** — Find relevant past experiences instantly (progressive disclosure: compact → timeline → full detail)
 - **Pattern detection** — Identifies recurring mistakes and successful workflows
+- **Automatic deduplication** — SHA-256 hashing with 15-minute window prevents duplicate entries
+- **Topic upserts** — Recurring topics update in place instead of creating duplicates
+- **Confidence decay** — Preferences lose confidence over time if not re-confirmed
+- **Soft delete** — Deleted memories can be recovered (marked, not destroyed)
+- **Claude Code hooks** — Auto-injects context on session start, captures actions automatically, summarizes sessions
 - **Memory management** — Forget specific memories or prune stale data automatically
 
 ## Quick start
@@ -180,7 +185,29 @@ Since the global instructions file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) is al
 | Codex CLI | `/compact` | `AGENTS.md` | Yes — sent with every request |
 | Gemini CLI | `/compress` | `GEMINI.md` | Yes — loaded as system instruction |
 
-> **Note:** None of the CLIs currently offer hooks or events for post-compaction actions. The instruction-based approach is the only reliable method across all three platforms.
+> **Note:** Claude Code supports hooks (see "Claude Code hooks" section above) which automate context recovery after compaction. For Codex and Gemini, the instruction-based approach is the only reliable method.
+
+## Claude Code hooks
+
+v1.0.0 includes hooks that automate memory usage in Claude Code. Install them by copying the `hooks/` directory and configuring `~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [{ "matcher": "startup|resume|compact|clear", "hooks": [{ "type": "command", "command": "~/.agent-memory-protocol/hooks/session-start.sh", "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "Write|Edit|Bash", "hooks": [{ "type": "command", "command": "~/.agent-memory-protocol/hooks/post-tool-use.sh", "async": true, "timeout": 5 }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "~/.agent-memory-protocol/hooks/session-end.sh", "timeout": 5 }] }]
+  }
+}
+```
+
+| Hook | When | What it does |
+|---|---|---|
+| `session-start.sh` | Session starts or compacts | Injects preferences, recent experiences, patterns, and corrections as context |
+| `post-tool-use.sh` | After Write/Edit/Bash | Auto-captures actions without manual tool calls |
+| `session-end.sh` | Session ends | Saves a session summary |
+
+**Requirements:** `jq` and `sqlite3` CLI (both included in macOS).
 
 ## Tools available
 
@@ -188,14 +215,16 @@ Once connected, the agent gets these tools:
 
 | Tool | What it does |
 |---|---|
-| `record_experience` | Save what was done, the result, and context |
+| `record_experience` | Save what was done, the result, and context. Supports `topic_key` for upserts |
 | `record_correction` | Learn from user corrections (intention compiler) |
-| `learn_preference` | Store preferences with global or project scope |
-| `query_memory` | Search past experiences by full text |
+| `learn_preference` | Store preferences with global or project scope (confidence starts at 0.3, decays over time) |
+| `query_memory` | Search past experiences — returns compact results (use `get_experience` for full details) |
+| `get_experience` | Get full details of a specific experience by ID |
+| `get_timeline` | Get chronological context around an experience |
 | `get_patterns` | View recurring patterns (errors, successes) |
-| `get_preferences` | List learned preferences (merged global + project) |
+| `get_preferences` | List learned preferences with effective confidence (merged global + project) |
 | `memory_stats` | Dashboard with memory statistics |
-| `forget_memory` | Delete specific memories by id, tag, or project |
+| `forget_memory` | Soft-delete specific memories by id, tag, or project |
 | `prune_memory` | Clean up old, failed, or low-confidence data |
 
 ### forget_memory
@@ -208,7 +237,7 @@ Delete specific memories from the database. Requires at least one parameter.
 | `tag` | string (optional) | Delete all experiences matching a tag |
 | `project` | string (optional) | Delete all experiences from a project |
 
-Returns the number of records deleted.
+Returns the number of records soft-deleted (can be recovered).
 
 ### prune_memory
 
