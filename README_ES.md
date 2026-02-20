@@ -118,16 +118,30 @@ Para que el agente consulte su memoria automaticamente al inicio de cada sesion,
 ```markdown
 ## Memoria persistente (MCP: agent-memory)
 
-Al inicio de cada sesion, SIEMPRE:
+El nombre del proyecto es el nombre de la carpeta donde trabajas
+(ej: si estás en /Users/me/projects/mi-app, el proyecto es "mi-app").
+
+### Inicio de sesión — SIEMPRE:
 1. Llamar a `get_preferences` con el nombre del proyecto actual
-2. Aplicar esas preferencias durante toda la sesion
+2. Aplicar esas preferencias durante toda la sesión
 
-Cuando el usuario te corrija:
-- Usar `record_correction` para registrar la leccion
-- Usar `learn_preference` si detectas una nueva preferencia
+### Correcciones y preferencias — SIEMPRE:
+- Cuando el usuario te corrija o rechace algo, usa `record_correction` SIEMPRE. Son pocas veces y el valor es alto.
+- Si detectas una preferencia nueva, usa `learn_preference` SIEMPRE (elige scope 'global' o el proyecto según corresponda).
 
-Cuando resuelvas algo complejo:
-- Usar `record_experience` para que futuras sesiones se beneficien
+### Experiencias — solo cuando hay complejidad real:
+Usa `record_experience` al terminar una tarea cuando se cumpla ALGUNA de estas condiciones:
+- Resolviste un bug o error (especialmente si no era obvio)
+- La solución requirió más de 2-3 pasos de investigación
+- Implementaste una feature nueva o un refactor significativo
+- Descubriste algo sobre la arquitectura del proyecto que podría ser útil después
+- NO guardes experiencias de tareas triviales (cambios de texto, CSS simple, cosas directas)
+
+### Consultar memoria — ante problemas o contexto nuevo:
+Usa `query_memory` en estas situaciones:
+- Cuando te encuentres un error o problema, ANTES de investigar desde cero
+- Al empezar a trabajar en un proyecto por primera vez en la sesión (un query rápido del proyecto)
+- NUNCA para tareas triviales o directas
 ```
 
 ## Sobrevivir a la compactacion de contexto

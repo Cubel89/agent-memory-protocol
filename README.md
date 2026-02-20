@@ -120,16 +120,30 @@ To make the agent check its memory automatically at the start of every session, 
 ```markdown
 ## Persistent memory (MCP: agent-memory)
 
-At the start of each session, ALWAYS:
+The project name is the folder name where you are working
+(e.g. if you are in /Users/me/projects/my-app, the project is "my-app").
+
+### Session startup — ALWAYS:
 1. Call `get_preferences` with the current project name
 2. Apply those preferences throughout the session
 
-When the user corrects you:
-- Use `record_correction` to register the lesson
-- Use `learn_preference` if you detect a new preference
+### Corrections and preferences — ALWAYS:
+- When the user corrects or rejects something, ALWAYS use `record_correction`. These are rare and high-value.
+- If you detect a new preference, ALWAYS use `learn_preference` (choose scope 'global' or the project name as appropriate).
 
-When you solve something complex:
-- Use `record_experience` so future sessions can benefit
+### Experiences — only when there is real complexity:
+Use `record_experience` after completing a task when ANY of these apply:
+- You resolved a bug or error (especially non-obvious ones)
+- The solution required more than 2-3 investigation steps
+- You implemented a new feature or significant refactor
+- You discovered something about the project architecture that could be useful later
+- Do NOT save experiences for trivial tasks (text changes, simple CSS, straightforward fixes)
+
+### Query memory — when facing problems or new context:
+Use `query_memory` in these situations:
+- When you encounter an error or problem, BEFORE investigating from scratch
+- When starting to work on a project for the first time in a session (a quick project query)
+- NEVER for trivial or straightforward tasks
 ```
 
 ## Surviving context compaction
