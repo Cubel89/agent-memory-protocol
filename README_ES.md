@@ -118,51 +118,61 @@ Para que el agente consulte su memoria automaticamente al inicio de cada sesion,
 ```markdown
 ## Memoria persistente (MCP: agent-memory)
 
-El nombre del proyecto es el nombre de la carpeta donde trabajas
-(ej: si estás en /Users/me/projects/mi-app, el proyecto es "mi-app").
+Nombre del proyecto = nombre de la carpeta de trabajo
+(ej: /Users/me/projects/mi-app -> "mi-app")
 
-### Inicio de sesión — SIEMPRE:
+### Inicio de sesion — SIEMPRE:
 1. Llamar a `get_preferences` con el nombre del proyecto actual
-2. Aplicar esas preferencias durante toda la sesión
+2. Aplicar preferencias durante toda la sesion
 
-### Correcciones y preferencias — SIEMPRE:
-- Cuando el usuario te corrija o rechace algo, usa `record_correction` SIEMPRE. Son pocas veces y el valor es alto.
-- Si detectas una preferencia nueva, usa `learn_preference` SIEMPRE (elige scope 'global' o el proyecto según corresponda).
+### ESCRIBIR en memoria — ser AGRESIVO:
 
-### Experiencias — solo cuando hay complejidad real:
-Usa `record_experience` al terminar una tarea cuando se cumpla ALGUNA de estas condiciones:
-- Resolviste un bug o error (especialmente si no era obvio)
-- La solución requirió más de 2-3 pasos de investigación
-- Implementaste una feature nueva o un refactor significativo
-- Descubriste algo sobre la arquitectura del proyecto que podría ser útil después
-- NO guardes experiencias de tareas triviales (cambios de texto, CSS simple, cosas directas)
+**Correcciones (`record_correction`) — OBLIGATORIO:**
+- Cada vez que el usuario rechace, corrija o diga "no" a algo → registrar inmediatamente
+- Cada vez que el usuario repita una instruccion que ya dio antes → registrar como correccion
+- Un rechazo = una correccion registrada, sin acumular
 
-### Consultar memoria — ante problemas o contexto nuevo:
-Usa `query_memory` en estas situaciones:
-- Cuando te encuentres un error o problema, ANTES de investigar desde cero
-- Al empezar a trabajar en un proyecto por primera vez en la sesión (un query rápido del proyecto)
-- NUNCA para tareas triviales o directas
+**Preferencias (`learn_preference`) — OBLIGATORIO:**
+- Detectar preferencias del usuario y guardarlas (scope: global o project)
+- Si el usuario dice "siempre haz X" o "nunca hagas Y" → guardar como preferencia
+- Si se detecta un patron en sus correcciones → guardar como preferencia
+
+**Experiencias (`record_experience`) — para tareas significativas:**
+- Resolucion de bugs o errores
+- Investigaciones de 2-3+ pasos
+- Implementaciones de funcionalidades
+- Descubrimientos sobre arquitectura del proyecto
+- NO registrar: saludos, cambios triviales de texto, preguntas simples
+
+### LEER la memoria — ANTES de actuar:
+
+**Consultar (`query_memory`) ANTES de:**
+- Programar o escribir codigo
+- Planificar implementaciones
+- Investigar problemas o errores
+- Tomar decisiones de arquitectura
+
+**NO consultar para:**
+- Saludos o conversacion casual
+- Tareas triviales donde no hay riesgo de repetir errores
+
+### Recuperacion de memoria tras compactacion
+
+Tras compactacion (`/compact`, `/compress`, o automatica):
+1. Llamar a `get_preferences` con el nombre del proyecto para recargar
+2. Llamar a `query_memory` si habia trabajo en curso
+3. Re-aplicar preferencias antes de continuar
 ```
 
 ## Sobrevivir a la compactacion de contexto
 
 Todos los CLIs de codificacion con IA tienen una funcion de compactacion o compresion que resume la conversacion para ahorrar tokens. Cuando esto ocurre, **las preferencias cargadas al inicio de la sesion pueden perderse** del contexto de trabajo del agente.
 
-Como el archivo de instrucciones globales (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) siempre se recarga con cada peticion — incluso despues de compactar — la solucion es añadir ahi una instruccion de recarga.
-
-Añade lo siguiente al mismo archivo de instrucciones donde configuraste la carga automatica:
-
-```markdown
-## Recuperacion de memoria tras compactacion
-
-Despues de cualquier compactacion de contexto (`/compact`, `/compress`, o automatica), SIEMPRE:
-1. Llamar a `get_preferences` con el nombre del proyecto actual para recargar preferencias
-2. Re-aplicar esas preferencias antes de continuar trabajando
-```
+Como el archivo de instrucciones globales (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) siempre se recarga con cada peticion — incluso despues de compactar — la solucion es incluir las instrucciones de recuperacion en el snippet de arriba.
 
 ### Como lo maneja cada CLI
 
-| CLI | Comando de compactacion | Archivo de instrucciones | ¿Sobrevive a la compactacion? |
+| CLI | Comando de compactacion | Archivo de instrucciones | Sobrevive a la compactacion |
 |---|---|---|---|
 | Claude Code | `/compact` | `CLAUDE.md` / `MEMORY.md` | Si — siempre en el system prompt |
 | Codex CLI | `/compact` | `AGENTS.md` | Si — se envia con cada peticion |

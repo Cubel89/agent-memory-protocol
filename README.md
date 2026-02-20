@@ -120,47 +120,57 @@ To make the agent check its memory automatically at the start of every session, 
 ```markdown
 ## Persistent memory (MCP: agent-memory)
 
-The project name is the folder name where you are working
-(e.g. if you are in /Users/me/projects/my-app, the project is "my-app").
+Project name = folder name where working
+(e.g., /Users/me/projects/my-app -> "my-app")
 
 ### Session startup — ALWAYS:
-1. Call `get_preferences` with the current project name
-2. Apply those preferences throughout the session
+1. Call `get_preferences` with current project name
+2. Apply preferences throughout session
 
-### Corrections and preferences — ALWAYS:
-- When the user corrects or rejects something, ALWAYS use `record_correction`. These are rare and high-value.
-- If you detect a new preference, ALWAYS use `learn_preference` (choose scope 'global' or the project name as appropriate).
+### WRITING to memory — be AGGRESSIVE:
 
-### Experiences — only when there is real complexity:
-Use `record_experience` after completing a task when ANY of these apply:
-- You resolved a bug or error (especially non-obvious ones)
-- The solution required more than 2-3 investigation steps
-- You implemented a new feature or significant refactor
-- You discovered something about the project architecture that could be useful later
-- Do NOT save experiences for trivial tasks (text changes, simple CSS, straightforward fixes)
+**Corrections (`record_correction`) — MANDATORY:**
+- Every time the user rejects, corrects or says "no" → record immediately
+- Every time the user repeats an instruction they already gave → record as correction
+- One rejection = one correction recorded, no batching
 
-### Query memory — when facing problems or new context:
-Use `query_memory` in these situations:
-- When you encounter an error or problem, BEFORE investigating from scratch
-- When starting to work on a project for the first time in a session (a quick project query)
-- NEVER for trivial or straightforward tasks
+**Preferences (`learn_preference`) — MANDATORY:**
+- Detect user preferences and save them (scope: global or project)
+- If the user says "always do X" or "never do Y" → save as preference
+- If a pattern emerges from their corrections → save as preference
+
+**Experiences (`record_experience`) — for meaningful tasks:**
+- Bug or error resolution
+- Investigations of 2-3+ steps
+- Feature implementations
+- Architecture discoveries about the project
+- DO NOT record: greetings, trivial text changes, simple questions
+
+### READING memory — BEFORE acting:
+
+**Query (`query_memory`) BEFORE:**
+- Writing or modifying code
+- Planning implementations
+- Investigating problems or errors
+- Making architecture decisions
+
+**DO NOT query for:**
+- Greetings or casual conversation
+- Trivial tasks with no risk of repeating mistakes
+
+### Memory recovery after compaction
+
+After compaction (`/compact`, `/compress`, or automatic):
+1. Call `get_preferences` with project name to reload
+2. Call `query_memory` if there was work in progress
+3. Re-apply preferences before continuing work
 ```
 
 ## Surviving context compaction
 
 All AI coding CLIs have a compaction or compression feature that summarizes the conversation to save tokens. When this happens, **preferences loaded at the start of the session can be lost** from the agent's working context.
 
-Since the global instructions file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) is always reloaded with every request — even after compaction — the solution is to add a reload instruction there.
-
-Add the following to the same instructions file where you configured auto-load:
-
-```markdown
-## Memory recovery after compaction
-
-After any context compaction (`/compact`, `/compress`, or automatic), ALWAYS:
-1. Call `get_preferences` with the current project name to reload preferences
-2. Re-apply those preferences before continuing work
-```
+Since the global instructions file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) is always reloaded with every request — even after compaction — the solution is to include the recovery instructions in the snippet above.
 
 ### How each CLI handles it
 
