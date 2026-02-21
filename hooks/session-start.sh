@@ -94,10 +94,12 @@ TOP_PATTERNS="$(sqlite3 -json "$DB" "
   LIMIT 3;
 " 2>/dev/null || echo '[]')"
 
-# --- Query last 3 corrections ---
+# --- Query last 3 corrections (guardadas en experiences con type='correction') ---
 RECENT_CORRECTIONS="$(sqlite3 -json "$DB" "
-  SELECT what_i_did, what_user_wanted, lesson, created_at
-  FROM corrections
+  SELECT context as what_i_did, action as what_user_wanted, result as lesson, created_at
+  FROM experiences
+  WHERE type = 'correction'
+    ${DELETED_FILTER}
   ORDER BY created_at DESC
   LIMIT 3;
 " 2>/dev/null || echo '[]')"

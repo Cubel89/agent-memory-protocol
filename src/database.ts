@@ -386,7 +386,7 @@ export const upsertPreference = db.prepare(`
   VALUES (@key, @value, @confidence, @source, @scope, 1, datetime('now'))
   ON CONFLICT(key, scope) DO UPDATE SET
     value = @value,
-    confidence = MIN(1.0, 0.3 + (confirmed_count) * 0.1),
+    confidence = MIN(1.0, 0.3 + (confirmed_count + 1) * 0.1),
     source = @source,
     updated_at = datetime('now'),
     confirmed_count = confirmed_count + 1,
