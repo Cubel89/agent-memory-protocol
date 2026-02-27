@@ -123,7 +123,7 @@ To make the agent check its memory automatically at the start of every session, 
 - **Gemini CLI** — `~/.gemini/GEMINI.md`
 
 ```markdown
-## Persistent memory (MCP: agent-memory)
+## Persistent memory (MCP: agent-memory) — AGGRESSIVE USAGE
 
 Project name = folder name where working
 (e.g., /Users/me/projects/my-app -> "my-app")
@@ -132,36 +132,38 @@ Project name = folder name where working
 1. Call `get_preferences` with current project name
 2. Apply preferences throughout session
 
-### WRITING to memory — be AGGRESSIVE:
+### QUERYING memory (query_memory) — BE PROACTIVE:
+Query memory in ALL these situations:
+- At session start: quick query of the project to recover context
+- Before implementing any feature or significant change
+- Before investigating any error or bug
+- When switching projects or modules within a project
+- When the user asks something you might have solved before
+- When making architecture or design decisions
+- **Simple rule: when in doubt, query. It's cheap and prevents repeating mistakes.**
 
-**Corrections (`record_correction`) — MANDATORY:**
+### WRITING to memory — BE GENEROUS:
+
+**Corrections (`record_correction`) — ALWAYS, no exceptions:**
 - Every time the user rejects, corrects or says "no" → record immediately
 - Every time the user repeats an instruction they already gave → record as correction
 - One rejection = one correction recorded, no batching
 
-**Preferences (`learn_preference`) — MANDATORY:**
-- Detect user preferences and save them (scope: global or project)
+**Preferences (`learn_preference`) — ALWAYS when you detect one:**
+- Any pattern the user repeats or explicitly requests
 - If the user says "always do X" or "never do Y" → save as preference
 - If a pattern emerges from their corrections → save as preference
+- Don't wait for them to say it twice: if stated clearly once, save it
 
-**Experiences (`record_experience`) — for meaningful tasks:**
-- Bug or error resolution
-- Investigations of 2-3+ steps
-- Feature implementations
+**Experiences (`record_experience`) — AFTER EVERY NON-TRIVIAL TASK:**
+- Bug or error resolution (obvious or not)
+- Investigations of 1-2+ steps
+- New feature implementations or modifications
 - Architecture discoveries about the project
-- DO NOT record: greetings, trivial text changes, simple questions
-
-### READING memory — BEFORE acting:
-
-**Query (`query_memory`) BEFORE:**
-- Writing or modifying code
-- Planning implementations
-- Investigating problems or errors
-- Making architecture decisions
-
-**DO NOT query for:**
-- Greetings or casual conversation
-- Trivial tasks with no risk of repeating mistakes
+- Infrastructure configuration or changes (git, deploy, servers, etc.)
+- Refactors or migrations
+- **Simple rule: if it took more than 2 minutes, it's probably worth saving**
+- Only skip truly trivial tasks (a typo, a greeting, a direct question)
 
 ### Memory recovery after compaction
 

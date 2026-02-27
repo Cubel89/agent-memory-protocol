@@ -121,7 +121,7 @@ Para que el agente consulte su memoria automaticamente al inicio de cada sesion,
 - **Gemini CLI** — `~/.gemini/GEMINI.md`
 
 ```markdown
-## Memoria persistente (MCP: agent-memory)
+## Memoria persistente (MCP: agent-memory) — USO AGRESIVO
 
 Nombre del proyecto = nombre de la carpeta de trabajo
 (ej: /Users/me/projects/mi-app -> "mi-app")
@@ -130,36 +130,38 @@ Nombre del proyecto = nombre de la carpeta de trabajo
 1. Llamar a `get_preferences` con el nombre del proyecto actual
 2. Aplicar preferencias durante toda la sesion
 
-### ESCRIBIR en memoria — ser AGRESIVO:
+### CONSULTAR memoria (query_memory) — SER PROACTIVO:
+Consulta la memoria en TODAS estas situaciones:
+- Al inicio de sesion: query rapido del proyecto para recuperar contexto
+- Antes de implementar cualquier feature o cambio significativo
+- Antes de investigar cualquier error o bug
+- Cuando cambies de proyecto o de modulo dentro de un proyecto
+- Cuando el usuario pregunte algo que podrias haber resuelto antes
+- Cuando vayas a tomar una decision de arquitectura o diseño
+- **Regla simple: ante la duda, consulta. Es barato y evita repetir errores.**
 
-**Correcciones (`record_correction`) — OBLIGATORIO:**
+### ESCRIBIR en memoria — SER GENEROSO:
+
+**Correcciones (`record_correction`) — SIEMPRE, sin excepcion:**
 - Cada vez que el usuario rechace, corrija o diga "no" a algo → registrar inmediatamente
 - Cada vez que el usuario repita una instruccion que ya dio antes → registrar como correccion
 - Un rechazo = una correccion registrada, sin acumular
 
-**Preferencias (`learn_preference`) — OBLIGATORIO:**
-- Detectar preferencias del usuario y guardarlas (scope: global o project)
+**Preferencias (`learn_preference`) — SIEMPRE que detectes una:**
+- Cualquier patron que el usuario repita o pida explicitamente
 - Si el usuario dice "siempre haz X" o "nunca hagas Y" → guardar como preferencia
 - Si se detecta un patron en sus correcciones → guardar como preferencia
+- No esperar a que lo diga dos veces: si lo dice una vez con claridad, guardarlo
 
-**Experiencias (`record_experience`) — para tareas significativas:**
-- Resolucion de bugs o errores
-- Investigaciones de 2-3+ pasos
-- Implementaciones de funcionalidades
+**Experiencias (`record_experience`) — DESPUES DE CADA TAREA NO TRIVIAL:**
+- Resolucion de bugs o errores (obvios o no)
+- Investigaciones de 1-2+ pasos
+- Implementaciones de funcionalidades nuevas o modificaciones
 - Descubrimientos sobre arquitectura del proyecto
-- NO registrar: saludos, cambios triviales de texto, preguntas simples
-
-### LEER la memoria — ANTES de actuar:
-
-**Consultar (`query_memory`) ANTES de:**
-- Programar o escribir codigo
-- Planificar implementaciones
-- Investigar problemas o errores
-- Tomar decisiones de arquitectura
-
-**NO consultar para:**
-- Saludos o conversacion casual
-- Tareas triviales donde no hay riesgo de repetir errores
+- Configuracion o cambios de infraestructura (git, deploy, servidores, etc.)
+- Refactors o migraciones
+- **Regla simple: si tardo mas de 2 minutos en hacerlo, probablemente vale la pena guardarlo**
+- Solo omitir en tareas realmente triviales (un typo, un saludo, una pregunta directa)
 
 ### Recuperacion de memoria tras compactacion
 
