@@ -2,7 +2,7 @@
 
 **Dale a tus agentes de IA memoria persistente entre sesiones.**
 
-Un servidor MCP (Model Context Protocol) que permite a los agentes de IA recordar experiencias, aprender de correcciones y adaptarse a tus preferencias. Funciona con Claude Code, Codex CLI, Gemini CLI y cualquier cliente compatible con MCP.
+Un servidor MCP (Model Context Protocol) que permite a los agentes de IA recordar experiencias, aprender de correcciones y adaptarse a tus preferencias. Funciona con Claude Code, Codex CLI, Gemini CLI, Pi y cualquier cliente compatible con MCP.
 
 ## Que hace
 
@@ -103,14 +103,190 @@ gemini mcp add agent-memory -- node /ruta/absoluta/a/agent-memory-protocol/build
 }
 ```
 
+### Pi (coding agent)
+
+Pi no soporta MCP nativamente — usa [extensiones](https://github.com/badlogic/pi-mono) en su lugar. Agent Memory se conecta a Pi mediante una extension TypeScript que actua como cliente MCP, lanzando el proceso del servidor por stdio y exponiendo todas las tools de forma nativa.
+
+**1. Crear el directorio de la extension:**
+
+```bash
+mkdir -p ~/.pi/agent/extensions/agent-memory
+```
+
+**2. Crear `~/.pi/agent/extensions/agent-memory/package.json`:**
+
+```json
+{
+  "name": "pi-agent-memory",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "pi": { "extensions": ["./index.ts"] },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.26.0"
+  }
+}
+```
+
+**3. Crear `~/.pi/agent/extensions/agent-memory/index.ts`:**
+
+```typescript
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import path from "node:path";
+import os from "node:os";
+
+const MCP_SERVER_PATH = path.join(
+  os.homedir(), ".agent-memory-protocol", "build", "index.js"
+);
+
+export default function agentMemory(pi: ExtensionAPI) {
+  let client: InstanceType<typeof Client> | null = null;
+  let transport: InstanceType<typeof StdioClientTransport> | null = null;
+  let connected = false;
+
+  async function connectToServer(): Promise<boolean> {
+    if (connected && client) return true;
+    try {
+      client = new Client({ name: "pi-agent-memory", version: "0.3.0" });
+      transport = new StdioClientTransport({
+        command: "node", args: [MCP_SERVER_PATH],
+      });
+      await client.connect(transport);
+      connected = true;
+      return true;
+    } catch (err: any) {
+      client = null; transport = null; connected = false;
+      return false;
+    }
+  }
+
+  async function disconnectFromServer() {
+    try { await transport?.close(); } catch {}
+    client = null; transport = null; connected = false;
+  }
+
+  async function callMcpTool(name: string, args: Record<string, any>): Promise<string> {
+    if (!connected || !client) {
+      if (!(await connectToServer())) return "Error: no se pudo conectar al servidor MCP.";
+    }
+    try {
+      const result = await client!.request(
+        { method: "tools/call", params: { name, arguments: args } },
+        CallToolResultSchema,
+      );
+      return result.content.map((c: any) => c.type === "text" ? c.text : JSON.stringify(c)).join("\n");
+    } catch (err: any) {
+      return `Error llamando a ${name}: ${err?.message ?? err}`;
+    }
+  }
+
+  function mcpTool(name: string, label: string, description: string, parameters: any) {
+    pi.registerTool({
+      name, label, description, parameters,
+      async execute(_id, params) {
+        const text = await callMcpTool(name, params as Record<string, any>);
+        return { content: [{ type: "text", text }], details: {} };
+      },
+    });
+  }
+
+  // Registrar las 11 tools
+  mcpTool("record_experience", "Record Experience",
+    "Guardar una experiencia en memoria.",
+    Type.Object({
+      context: Type.String(), action: Type.String(), result: Type.String(),
+      success: Type.Boolean(),
+      tags: Type.Optional(Type.String()), project: Type.Optional(Type.String()),
+      topic_key: Type.Optional(Type.String()),
+    }));
+
+  mcpTool("record_correction", "Record Correction",
+    "Registrar cuando el usuario corrige o rechaza una accion.",
+    Type.Object({
+      what_i_did: Type.String(), what_user_wanted: Type.String(), lesson: Type.String(),
+      tags: Type.Optional(Type.String()), project: Type.Optional(Type.String()),
+    }));
+
+  mcpTool("learn_preference", "Learn Preference",
+    "Guardar o actualizar una preferencia del usuario.",
+    Type.Object({
+      key: Type.String(), value: Type.String(),
+      scope: Type.Optional(Type.String()), source: Type.Optional(Type.String()),
+    }));
+
+  mcpTool("query_memory", "Query Memory",
+    "Buscar experiencias relevantes en memoria.",
+    Type.Object({
+      query: Type.String(),
+      project: Type.Optional(Type.String()), limit: Type.Optional(Type.Number()),
+    }));
+
+  mcpTool("get_preferences", "Get Preferences",
+    "Devuelve preferencias del usuario (global + proyecto).",
+    Type.Object({ project: Type.Optional(Type.String()) }));
+
+  mcpTool("get_experience", "Get Experience",
+    "Obtener detalle completo de una experiencia por ID.",
+    Type.Object({ id: Type.Number() }));
+
+  mcpTool("get_timeline", "Get Timeline",
+    "Obtener contexto cronologico alrededor de una experiencia.",
+    Type.Object({ id: Type.Number() }));
+
+  mcpTool("get_patterns", "Get Patterns",
+    "Devuelve los patrones mas frecuentes detectados.",
+    Type.Object({ limit: Type.Optional(Type.Number()) }));
+
+  mcpTool("forget_memory", "Forget Memory",
+    "Soft-delete de memorias por id, tag o proyecto.",
+    Type.Object({
+      id: Type.Optional(Type.Number()), tag: Type.Optional(Type.String()),
+      project: Type.Optional(Type.String()),
+    }));
+
+  mcpTool("prune_memory", "Prune Memory",
+    "Eliminar experiencias antiguas o preferencias de baja confianza.",
+    Type.Object({
+      older_than_days: Type.Optional(Type.Number()),
+      only_failures: Type.Optional(Type.Boolean()),
+      min_confidence: Type.Optional(Type.Number()),
+    }));
+
+  mcpTool("memory_stats", "Memory Stats",
+    "Muestra estadisticas de la memoria.",
+    Type.Object({}));
+
+  pi.on("session_start", async (_event, ctx) => {
+    const ok = await connectToServer();
+    ctx.ui.notify(ok ? "🧠 Agent Memory conectado" : "⚠️ Agent Memory: conexion fallida", ok ? "info" : "error");
+  });
+
+  pi.on("session_shutdown", async () => { await disconnectFromServer(); });
+}
+```
+
+**4. Instalar dependencias y recargar:**
+
+```bash
+cd ~/.pi/agent/extensions/agent-memory && npm install
+```
+
+Reinicia Pi o ejecuta `/reload`. Deberas ver "🧠 Agent Memory conectado" al arrancar.
+
+> **Nota:** Pi no usa MCP. Esta extension lanza el servidor MCP como proceso hijo y se comunica por stdio, reutilizando el mismo `build/index.js` sin modificaciones.
+
 ## Compatibilidad entre CLIs
 
-| Caracteristica | Claude Code | Codex CLI | Gemini CLI |
-|---|---|---|---|
-| Comando MCP add | `claude mcp add` | `codex mcp add` | `gemini mcp add` |
-| Formato de config | JSON (`~/.claude.json`) | TOML (`~/.codex/config.toml`) | JSON (`~/.gemini/settings.json`) |
-| Instrucciones globales | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | `~/.gemini/GEMINI.md` |
-| Flag de alcance global | `--scope user` | — | — |
+| Caracteristica | Claude Code | Codex CLI | Gemini CLI | Pi |
+|---|---|---|---|---|
+| Comando MCP add | `claude mcp add` | `codex mcp add` | `gemini mcp add` | — (extension) |
+| Formato de config | JSON (`~/.claude.json`) | TOML (`~/.codex/config.toml`) | JSON (`~/.gemini/settings.json`) | Extension TypeScript |
+| Instrucciones globales | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | `~/.gemini/GEMINI.md` | `~/.pi/agent/AGENTS.md` |
+| Flag de alcance global | `--scope user` | — | — | — |
 
 ## Carga automatica al inicio
 
@@ -119,6 +295,7 @@ Para que el agente consulte su memoria automaticamente al inicio de cada sesion,
 - **Claude Code** — `~/.claude/CLAUDE.md`
 - **Codex CLI** — `~/.codex/AGENTS.md`
 - **Gemini CLI** — `~/.gemini/GEMINI.md`
+- **Pi** — `~/.pi/agent/AGENTS.md`
 
 ```markdown
 ## Memoria persistente (MCP: agent-memory) — USO AGRESIVO
@@ -184,8 +361,9 @@ Como el archivo de instrucciones globales (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`
 | Claude Code | `/compact` | `CLAUDE.md` / `MEMORY.md` | Si — siempre en el system prompt |
 | Codex CLI | `/compact` | `AGENTS.md` | Si — se envia con cada peticion |
 | Gemini CLI | `/compress` | `GEMINI.md` | Si — se carga como system instruction |
+| Pi | `/compact` | `AGENTS.md` | Si — se recarga con cada peticion |
 
-> **Nota:** Claude Code soporta hooks (ver seccion "Hooks de Claude Code" arriba) que automatizan la recuperacion de contexto tras compactacion. Para Codex y Gemini, el enfoque basado en instrucciones es el unico metodo fiable.
+> **Nota:** Claude Code soporta hooks (ver seccion "Hooks de Claude Code" arriba) que automatizan la recuperacion de contexto tras compactacion. Para Codex y Gemini, el enfoque basado en instrucciones es el unico metodo fiable. Las extensiones de Pi tambien pueden enganchar eventos `session_before_compact` para logica de recuperacion personalizada.
 
 ## Hooks de Claude Code
 
