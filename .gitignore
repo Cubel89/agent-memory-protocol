@@ -1,0 +1,11 @@
+node_modules/
+build/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+.DS_Store
+*.log
+
+# Documentación interna (no se publica)
+CLAUDE.md
+
