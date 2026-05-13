@@ -4,6 +4,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { EMBEDDING_DIMS } from "./embeddings.js";
+import { normalizeTextPaths } from "./paths.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, "..", "data", "memory.db");
@@ -249,6 +250,16 @@ export async function insertOrDeduplicate(params: {
   project: string;
   topic_key?: string;
 }): Promise<{ id: number; deduplicated: boolean; upserted?: boolean }> {
+  // Normalizar paths absolutos del sandbox a `$SANDBOX_ROOT` antes de guardar
+  // para que las experiencias sean portables entre máquinas con distintos
+  // paths de sandbox (~/.sandbox, ~/sandbox, ...).
+  params = {
+    ...params,
+    context: normalizeTextPaths(params.context),
+    action: normalizeTextPaths(params.action),
+    result: normalizeTextPaths(params.result),
+  };
+
   const hash = computeHash(params.context, params.action, params.result);
   const embeddingText = `${params.context} ${params.action} ${params.result}`;
 
@@ -509,6 +520,10 @@ export const getPreference = db.prepare(`
 // ── Patterns ────────────────────────────────────────────
 
 export function recordPattern(description: string, category: string, example: string) {
+  // Normalizar paths absolutos del sandbox para portabilidad entre máquinas.
+  description = normalizeTextPaths(description);
+  example = normalizeTextPaths(example);
+
   const existing = db.prepare(`SELECT * FROM patterns WHERE description = ?`).get(description) as any;
 
   if (existing) {

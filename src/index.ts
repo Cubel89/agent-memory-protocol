@@ -35,6 +35,7 @@ import {
 
 import { getEmbedding, preloadModel } from "./embeddings.js";
 import { startSocketServer } from "./socket-server.js";
+import { normalizeTextPaths } from "./paths.js";
 
 // ── MCP Server ──────────────────────────────────────────
 
@@ -163,12 +164,17 @@ server.registerTool(
   async ({ key, value, scope, source }) => {
     const effectiveScope = scope || "global";
 
+    // Normalizar paths absolutos del sandbox para portabilidad entre máquinas.
+    const valueNorm = normalizeTextPaths(value);
+    const sourceNorm = normalizeTextPaths(source || "observed");
+    const scopeNorm = normalizeTextPaths(effectiveScope);
+
     upsertPreference.run({
       key,
-      value,
+      value: valueNorm,
       confidence: 0.3,
-      source: source || "observed",
-      scope: effectiveScope,
+      source: sourceNorm,
+      scope: scopeNorm,
     });
     checkpoint();
 
