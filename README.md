@@ -2,37 +2,58 @@
 
 [Leer en Español](README_ES.md)
 
-**Give your AI agents persistent memory across sessions — now with semantic search.**
+**Give your AI agents persistent memory across sessions — with semantic search and a context-budget discipline.**
 
-An MCP (Model Context Protocol) server that lets AI agents remember experiences, learn from corrections, and adapt to your preferences. v2.0.0 adds **vector-based semantic search** powered by a local embedding model that auto-downloads on first use. Works with Claude Code, Codex CLI, Gemini CLI, and any MCP-compatible client.
+An MCP (Model Context Protocol) server that lets AI agents remember experiences, learn from corrections, and adapt to your preferences. v3.0.0 focuses on **retrieval quality and context economy**: every automatic output is budget-capped, session context is an index instead of a dump, prompt injection only happens above a relevance threshold, and built-in telemetry measures exactly how many characters (and tokens) each channel consumes. Works with Claude Code, Codex CLI, Gemini CLI, and any MCP-compatible client.
 
 ## What it does
 
 - **Semantic search** — Finds relevant memories by meaning, not just keywords. "How did I fix the payments?" matches experiences about billing, invoices, and transactions
-- **Hybrid search** — Combines FTS5 keyword search + vector similarity with Reciprocal Rank Fusion for the best of both worlds
+- **Hybrid search** — Combines FTS5 keyword search + vector similarity into an absolute, thresholdable score
 - **Local embeddings** — all-MiniLM-L6-v2 model (23 MB) runs locally via ONNX. Auto-downloads on first use, works 100% offline after that
+- **Budget-capped outputs** — Session context and `get_preferences` respect hard character budgets; nothing dumps unbounded text into the context window
+- **Index-first session context** — Session start injects a compact index (one line per item) and the agent drills down on demand with `get_memory(ids)`
+- **Relevance-gated prompt injection** — The `UserPromptSubmit` hook only injects memories that clear a relevance threshold; irrelevant prompts get nothing
 - **Unix socket for hooks** — The MCP server exposes a local socket so Claude Code hooks can perform semantic search in ~25ms per query
 - **Remembers experiences** — What worked, what failed, in what context
 - **Learns from corrections** — Every time you correct the agent, it records the lesson
-- **Adapts to preferences** — Detects patterns in how you work and remembers them
 - **Scoped memory** — Global preferences + project-specific overrides
 - **Pattern detection** — Identifies recurring mistakes and successful workflows
+- **Semantic dedupe on write** — A new preference whose meaning matches an existing one merges into it instead of creating a near-duplicate key
 - **Automatic deduplication** — SHA-256 hashing with 15-minute window prevents duplicate entries
 - **Topic upserts** — Recurring topics update in place instead of creating duplicates
-- **Confidence decay** — Preferences lose confidence over time if not re-confirmed
-- **Soft delete** — Deleted memories can be recovered (marked, not destroyed)
-- **Claude Code hooks** — Auto-injects context before every response via `UserPromptSubmit` hook
+- **Confidence decay without floor** — Stale preferences keep losing weight until they drop out of automatic outputs (below 0.3 effective confidence); they stay reachable via explicit lookup
+- **Reversible invalidation** — Forgotten preferences are invalidated (`invalidated_at` / `superseded_by`), never destroyed; re-learning restores them
+- **Offline consolidation** — `consolidate` CLI command dedupes preferences, purges old soft-deleted rows, cleans orphan vectors and VACUUMs (dry-run by default, `--apply` to execute)
+- **Output telemetry** — `memory_stats` reports avg/p95 characters (and estimated tokens) per retrieval channel over the last 30 days
 - **Memory management** — Forget specific memories or prune stale data automatically
 
-## What's new in v2.0.0
+## What's new in v3.0.0
 
-| Feature | v1.x | v2.0.0 |
+| Feature | v2.x | v3.0.0 |
 |---|---|---|
-| Search | FTS5 keywords only | **Hybrid: FTS5 + vector semantic** |
-| Hook | SessionStart only | **UserPromptSubmit** (every message) |
-| Context injection | Manual (agent decides) | **Automatic** (hook injects before every response) |
-| Embedding model | None | **all-MiniLM-L6-v2** (23 MB, 384 dims, local ONNX) |
-| Vector store | None | **sqlite-vec** (cosine distance, ~2ms KNN) |
+| Session context | Full dump of preferences + experiences | **Compact index** under a hard 4,000-char budget |
+| Prompt injection | Always injected something | **Relevance threshold** (score ≥ 0.4); silent when nothing qualifies |
+| `get_preferences` | Unbounded list | **Bounded by default** (limit 15, min confidence 0.4, 6,000-char budget); `key=` / `all=true` escape hatches |
+| Preference decay | Floored at 0.5 | **No floor** — drops out of automatic outputs below 0.3 effective confidence |
+| Forgetting preferences | Hard delete | **Reversible invalidation** (`invalidated_at`, `superseded_by`) |
+| Duplicate preferences | Accumulated | **Semantic dedupe on write** + offline `consolidate` command |
+| Tool surface | 11 tools | **9 tools** (see breaking changes) |
+| Measurement | None | **Telemetry**: chars/tokens per channel in `memory_stats` |
+
+### Breaking changes (v2 → v3)
+
+Three tools were consolidated. If you have instructions or scripts referencing them, update:
+
+| Removed tool | Replacement |
+|---|---|
+| `get_experience(id)` | `get_memory({ ids: [id, ...] })` — batch, returns full detail for several memories at once |
+| `get_timeline(id)` | `get_memory({ ids: [id], timeline: true })` |
+| `get_patterns()` | `memory_stats({ include: ["patterns"] })` |
+
+The five core tool names are unchanged: `get_preferences`, `query_memory`, `learn_preference`, `record_experience`, `record_correction`.
+
+Also note: the `UserPromptSubmit` hook no longer injects context on every message — only when a memory clears the relevance threshold. Without the vector channel (sqlite-vec unavailable), the on-prompt hook injects nothing.
 
 ### Architecture
 
@@ -46,14 +67,16 @@ User sends message
   [MCP Server]  ← already running, model in RAM
        |
        | 1. Generates embedding (~20ms)
-       | 2. Hybrid search: FTS5 + vector KNN + RRF merge
-       | 3. Loads preferences + corrections
+       | 2. Hybrid search: FTS5 + vector KNN, fused into an absolute score
+       | 3. Keeps only results above the relevance threshold (0.4, max 3)
        v
-  Returns relevant context
+  Relevant memories found?  ── no ──> nothing injected
        |
-  [Hook returns additionalContext]
+      yes
        |
-  Agent receives message + memory context INJECTED
+  [Hook returns context]
+       |
+  Agent receives message + only the memories that matter
 ```
 
 ## Quick start
@@ -71,6 +94,10 @@ npm run build
 ```
 
 On first use, the embedding model (~23 MB) downloads automatically from Hugging Face Hub. After that, it works completely offline.
+
+### Migrating from v2.x
+
+The database schema migrates automatically on first start (new columns and the telemetry table are added in place). The only manual change is the tool consolidation — see [Breaking changes](#breaking-changes-v2--v3).
 
 ### Migrating from v1.x
 
@@ -161,13 +188,16 @@ gemini mcp add agent-memory -- node /absolute/path/to/agent-memory-protocol/buil
 | Config format | JSON (`~/.claude.json`) | TOML (`~/.codex/config.toml`) | JSON (`~/.gemini/settings.json`) |
 | Global instructions | `~/.claude/CLAUDE.md` | `~/.codex/AGENTS.md` | `~/.gemini/GEMINI.md` |
 | Global scope flag | `--scope user` | — | — |
-| Hooks support | Yes (v2.0.0) | No | No |
+| Hooks support | Yes | No | No |
 
-## Claude Code hooks (v2.0.0)
+## Claude Code hooks
 
-v2.0.0 introduces a **Unix socket server** that enables Claude Code hooks to perform semantic search with near-zero latency. The MCP server loads the embedding model once and keeps it in RAM, so hooks don't need to load it on every request.
+The MCP server runs a **Unix socket server** that enables Claude Code hooks to perform semantic search with near-zero latency. The server loads the embedding model once and keeps it in RAM, so hooks don't need to load it on every request.
 
-The key hook is `UserPromptSubmit`, which fires **before every user message**. This means Claude always has relevant memory context injected automatically — no need to rely on the LLM remembering to call tools.
+Two hooks work together:
+
+- `SessionStart` injects a **compact memory index** (top preferences, relevant experiences, patterns, corrections — one line each, hard 4,000-char budget). After `/compact` or `/clear` it sends only a minimal reminder, since the conversation summary already preserves the working context.
+- `UserPromptSubmit` fires before every user message, but since v3.0.0 it is **relevance-gated**: it injects at most 3 memories whose fused score clears the 0.4 threshold, and injects **nothing** otherwise. Because the FTS-only channel can never reach that score by itself, the hook stays silent when the vector channel (sqlite-vec + embeddings) is unavailable.
 
 ### Setup
 
@@ -193,8 +223,8 @@ Copy `hooks/on-prompt.sh` to your installation directory and configure `~/.claud
 
 | Hook | When | What it does |
 |---|---|---|
-| `session-start.sh` | Session start (startup, resume, compact, clear) | Tries Unix socket for hybrid search context (vector + FTS5 + patterns + corrections), falls back to `cli.js get_context` (FTS5 + recent only) |
-| `on-prompt.sh` | Every user message | Sends prompt to Unix socket, gets semantic search results + user data + preferences + corrections, injects as plain text context |
+| `session-start.sh` | Session start (startup, resume, compact, clear) | Tries Unix socket for the budget-capped memory index (vector + FTS5 + patterns + corrections), falls back to `cli.js get_context` (same index format, FTS5 + recent only) |
+| `on-prompt.sh` | Every user message | Sends prompt to Unix socket; injects up to 3 memories that clear the relevance threshold, or nothing at all. Preferences and corrections arrive via session start, not here |
 
 **Requirements:** `jq` and `nc` (netcat) — both included in macOS and most Linux distributions.
 
@@ -202,12 +232,12 @@ Copy `hooks/on-prompt.sh` to your installation directory and configure `~/.claud
 
 ### How it works
 
-1. When the MCP server starts, it opens a Unix socket at `/tmp/agent-memory.sock` and pre-loads the embedding model
+1. When the MCP server starts, it opens a Unix socket at `/tmp/agent-memory.sock` (the embedding model loads lazily on the first query)
 2. On every user message, `on-prompt.sh` sends the prompt to the socket
-3. The server generates an embedding, runs hybrid search (FTS5 + vector KNN across experiences AND preferences), and builds a context string
-4. The hook outputs the context as plain text — Claude Code injects it as a `system-reminder`
-5. Total latency: **~25ms** (20ms embedding + 2ms vector search + 3ms FTS5)
-6. Personal preferences (`user_*`) are **always included** regardless of search relevance
+3. The server generates an embedding and runs hybrid search (FTS5 + vector KNN across experiences AND preferences), fusing both channels into an absolute score
+4. Only results with a fused score ≥ 0.4 are kept (max 3); if none qualify, the hook injects nothing
+5. The hook outputs the context as plain text — Claude Code injects it as a `system-reminder`
+6. Total latency: **~25ms** (20ms embedding + 2ms vector search + 3ms FTS5)
 
 ## Auto-load instructions
 
@@ -262,16 +292,14 @@ Once connected, the agent gets these tools:
 
 | Tool | What it does |
 |---|---|
-| `record_experience` | Save what was done, the result, and context. Supports `topic_key` for upserts and optional `type` (experience, decision, gotcha, discovery). **v2: auto-generates vector embedding** |
-| `record_correction` | Learn from user corrections. **v2: auto-generates vector embedding** |
-| `learn_preference` | Store preferences with global or project scope (confidence starts at 0.3, decays over time) |
-| `query_memory` | **v2: Hybrid search** — FTS5 keywords + vector semantic + RRF merge. Returns compact results (80 chars, default limit 8). Use `get_experience(id)` for details. Falls back to FTS5-only if embeddings unavailable |
-| `get_experience` | Get full details of a specific experience by ID |
-| `get_timeline` | Get chronological context around an experience |
-| `get_patterns` | View recurring patterns (errors, successes) |
-| `get_preferences` | List learned preferences with effective confidence (merged global + project) |
-| `memory_stats` | Dashboard with memory statistics |
-| `forget_memory` | Soft-delete specific memories by id, tag, or project |
+| `record_experience` | Save what was done, the result, and context. Supports `topic_key` for upserts and optional `type` (experience, decision, gotcha, discovery). Auto-generates vector embedding |
+| `record_correction` | Learn from user corrections. Auto-generates vector embedding |
+| `learn_preference` | Store preferences with global or project scope (confidence starts at 0.3, decays over time). Semantic dedupe: near-identical values merge into the existing preference |
+| `query_memory` | Hybrid search — FTS5 keywords + vector semantic, fused into an absolute score. Returns a compact index (default limit 8); drill down with `get_memory(ids)`. Falls back to FTS5-only if embeddings unavailable |
+| `get_memory` | **v3:** Full detail for one or more memories by id (batch, max 20). `timeline: true` adds the ±1-hour timeline around each experience |
+| `get_preferences` | List learned preferences (merged global + project), bounded by default (limit 15, min effective confidence 0.4, 6,000-char budget). `key="name"` returns one full preference; `all: true` returns everything |
+| `memory_stats` | Statistics + retrieval telemetry (avg/p95 chars and ~tokens per channel, last 30 days). `include: ["patterns"]` adds the full detected-patterns list |
+| `forget_memory` | Soft-delete experiences by id, tag, or project; invalidate preferences reversibly (`preference_key`) |
 | `prune_memory` | Clean up old, failed, or low-confidence data |
 
 ## How scopes work
@@ -327,9 +355,21 @@ All data is stored locally. Nothing leaves your machine (except the one-time mod
 ### Tables
 
 - **experiences** — What happened, what was done, the outcome
-- **preferences** — Key-value pairs with confidence scores and scopes
+- **preferences** — Key-value pairs with confidence scores, scopes, and reversible invalidation (`invalidated_at`, `superseded_by`)
 - **patterns** — Recurring observations with frequency tracking
-- **vec_experiences** — Vector embeddings for semantic search (sqlite-vec virtual table)
+- **vec_experiences / vec_preferences** — Vector embeddings for semantic search (sqlite-vec virtual tables)
+- **telemetry** — Output size per retrieval channel (`ts`, `channel`, `project`, `chars`, `items`), summarized by `memory_stats`
+
+## Maintenance: the `consolidate` command
+
+Run it manually or from cron to keep the database clean. Dry-run by default — nothing is modified until you pass `--apply`:
+
+```bash
+node build/cli.js consolidate            # report only
+node build/cli.js consolidate --apply    # execute
+```
+
+It detects near-duplicate preference pairs (cosine similarity above the dedupe threshold) and invalidates the weaker one reversibly, purges experiences soft-deleted more than 90 days ago, removes orphaned vector rows, rebuilds the FTS index, and VACUUMs the database.
 
 ## Platform compatibility
 
