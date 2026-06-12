@@ -1,6 +1,6 @@
 {
   "name": "agent-memory-protocol",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "MCP Server that gives AI agents persistent memory across sessions. Remembers experiences, learns from corrections, and adapts to user preferences.",
   "main": "build/index.js",
   "type": "module",

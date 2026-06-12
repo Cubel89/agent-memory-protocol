@@ -5,6 +5,13 @@ import { fileURLToPath } from "url";
 import { createHash } from "crypto";
 import { EMBEDDING_DIMS } from "./embeddings.js";
 import { normalizeTextPaths } from "./paths.js";
+import { ensureTelemetryTable } from "./telemetry.js";
+import { applyPreferenceOptions, type PreferenceOptions } from "./context-format.js";
+import { clampSimilarity, computeFtsScore, fuseScores, applyDecay } from "./scoring.js";
+
+// Temporal decay moved to scoring.ts (pure module); re-exported here so
+// existing importers keep working.
+export { computeDecayFactor, applyDecay } from "./scoring.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, "..", "data", "memory.db");
@@ -83,6 +90,9 @@ export function initDatabase(dbPath?: string) {
         -- Phase 6: Temporal decay
         confirmed_count   INTEGER DEFAULT 1,
         last_confirmed_at TEXT DEFAULT (datetime('now')),
+        -- Retrieval v3: reversible invalidation
+        invalidated_at    TEXT DEFAULT NULL,
+        superseded_by     TEXT DEFAULT NULL,
         UNIQUE(key, scope)
       );
     `);
@@ -141,6 +151,18 @@ export function initDatabase(dbPath?: string) {
     db.exec(`ALTER TABLE preferences ADD COLUMN confirmed_count INTEGER DEFAULT 1`);
     db.exec(`ALTER TABLE preferences ADD COLUMN last_confirmed_at TEXT DEFAULT (datetime('now'))`);
   }
+
+  // Retrieval v3: reversible invalidation for preferences (Zep-style).
+  // Invalidated rows are hidden from automatic retrieval but kept in the
+  // table so they can be restored or inspected via explicit key lookup.
+  const hasInvalidatedAt = prefCols.some((col: any) => col.name === "invalidated_at");
+  if (!hasInvalidatedAt) {
+    db.exec(`ALTER TABLE preferences ADD COLUMN invalidated_at TEXT DEFAULT NULL`);
+    db.exec(`ALTER TABLE preferences ADD COLUMN superseded_by TEXT DEFAULT NULL`);
+  }
+
+  // Retrieval v3: output-size telemetry (see telemetry.ts)
+  ensureTelemetryTable(db);
 
   // ── Indexes ────────────────────────────────────────────
 
@@ -444,6 +466,7 @@ export const getExperiencesByType = db.prepare(`
 // ── Preferences with scope ──────────────────────────────
 // Phase 6: Base confidence 0.3, confirmed_count tracking
 
+// Re-learning a preference explicitly revalidates it (clears invalidation).
 export const upsertPreference = db.prepare(`
   INSERT INTO preferences (key, value, confidence, source, scope, confirmed_count, last_confirmed_at)
   VALUES (@key, @value, @confidence, @source, @scope, 1, datetime('now'))
@@ -453,49 +476,56 @@ export const upsertPreference = db.prepare(`
     source = @source,
     updated_at = datetime('now'),
     confirmed_count = confirmed_count + 1,
-    last_confirmed_at = datetime('now')
+    last_confirmed_at = datetime('now'),
+    invalidated_at = NULL,
+    superseded_by = NULL
 `);
 
-// Returns global preferences
+// Returns global preferences (automatic retrieval: invalidated rows hidden)
 export const getGlobalPreferences = db.prepare(`
   SELECT * FROM preferences
-  WHERE scope = 'global'
+  WHERE scope = 'global' AND invalidated_at IS NULL
   ORDER BY confidence DESC
 `);
 
-// Returns preferences for a specific project
+// Returns preferences for a specific project (invalidated rows hidden)
 export const getProjectPreferences = db.prepare(`
   SELECT * FROM preferences
-  WHERE scope = @scope
+  WHERE scope = @scope AND invalidated_at IS NULL
   ORDER BY confidence DESC
 `);
 
-// Phase 6: Decay factor calculation
-export function computeDecayFactor(lastConfirmedAt: string | null): number {
-  if (!lastConfirmedAt) return 0.5; // no confirmation date = max decay
-  const now = Date.now();
-  const confirmed = new Date(lastConfirmedAt + "Z").getTime();
-  const daysSince = (now - confirmed) / (1000 * 60 * 60 * 24);
+// ── Reversible invalidation (retrieval v3) ──────────────
+// Invalidation hides a preference from every automatic retrieval path
+// (getGlobalPreferences, getMergedPreferences, session_start, on-prompt)
+// without deleting the row, so it can always be restored. superseded_by
+// optionally records the key of the preference that replaced it.
 
-  if (daysSince <= 30) return 1.0;
-  if (daysSince <= 90) return 0.9;
-  if (daysSince <= 180) return 0.7;
-  return 0.5;
+const invalidatePreferenceStmt = db.prepare(`
+  UPDATE preferences
+  SET invalidated_at = datetime('now'), superseded_by = @superseded_by
+  WHERE key = @key AND scope = @scope AND invalidated_at IS NULL
+`);
+
+export function invalidatePreference(key: string, scope: string, supersededBy?: string): boolean {
+  return invalidatePreferenceStmt.run({ key, scope, superseded_by: supersededBy ?? null }).changes > 0;
 }
 
-export function applyDecay(pref: any): any {
-  const decay = computeDecayFactor(pref.last_confirmed_at);
-  const effectiveConfidence = Math.round(pref.confidence * decay * 100) / 100;
-  return {
-    ...pref,
-    effective_confidence: effectiveConfidence,
-    decay_factor: decay,
-  };
+const restorePreferenceStmt = db.prepare(`
+  UPDATE preferences
+  SET invalidated_at = NULL, superseded_by = NULL
+  WHERE key = @key AND scope = @scope AND invalidated_at IS NOT NULL
+`);
+
+export function restorePreference(key: string, scope: string): boolean {
+  return restorePreferenceStmt.run({ key, scope }).changes > 0;
 }
 
 // Returns merged preferences: project + global (project takes priority)
 // Phase 6: Applies temporal decay
-export function getMergedPreferences(project: string) {
+// Optional limit / minEffectiveConfidence applied after merge+decay+sort;
+// without options the full merged list is returned (backwards compatible).
+export function getMergedPreferences(project: string, options?: PreferenceOptions) {
   const global = getGlobalPreferences.all() as any[];
   const projectPrefs = getProjectPreferences.all({ scope: project }) as any[];
 
@@ -508,9 +538,11 @@ export function getMergedPreferences(project: string) {
     merged.set(pref.key, { ...pref, _origin: "project" });
   }
 
-  return Array.from(merged.values())
+  const sorted = Array.from(merged.values())
     .map(applyDecay)
     .sort((a, b) => b.effective_confidence - a.effective_confidence);
+
+  return applyPreferenceOptions(sorted, options);
 }
 
 export const getPreference = db.prepare(`
@@ -669,10 +701,42 @@ export function sanitizeFtsQuery(query: string): string | null {
   return words.join(" OR ");
 }
 
-// ── Hybrid search (FTS5 + vector + RRF) ──────────────────
+// ── Hybrid search (FTS5 + vector fusion) ─────────────────
+
+// FTS queries that expose the raw BM25 rank plus the searchable text,
+// so the caller can compute a proportional score (term coverage * BM25).
+export const searchExperiencesScored = db.prepare(`
+  SELECT e.id, bm25(experiences_fts) AS bm25_score,
+    lower(coalesce(e.context, '') || ' ' || coalesce(e.action, '') || ' ' ||
+          coalesce(e.result, '') || ' ' || coalesce(e.tags, '')) AS haystack
+  FROM experiences e
+  JOIN experiences_fts fts ON e.id = fts.rowid
+  WHERE experiences_fts MATCH @query
+    AND e.deleted_at IS NULL
+  ORDER BY bm25(experiences_fts)
+  LIMIT @limit
+`);
+
+export const searchExperiencesScoredByProject = db.prepare(`
+  SELECT e.id, bm25(experiences_fts) AS bm25_score,
+    lower(coalesce(e.context, '') || ' ' || coalesce(e.action, '') || ' ' ||
+          coalesce(e.result, '') || ' ' || coalesce(e.tags, '')) AS haystack
+  FROM experiences e
+  JOIN experiences_fts fts ON e.id = fts.rowid
+  WHERE experiences_fts MATCH @query AND (e.project = @project OR e.project = '')
+    AND e.deleted_at IS NULL
+  ORDER BY bm25(experiences_fts)
+  LIMIT @limit
+`);
 
 export type HybridResult = { id: number; score: number; source: "experience" | "preference" };
 
+// Score fusion formula (absolute, thresholdable, range [0, 1]):
+//   score = 0.7 * vectorSimilarity + 0.3 * ftsScore
+// where vectorSimilarity = clamp01(1 - cosine distance) and
+// ftsScore = termCoverage * normalizedBm25 (see scoring.ts). The FTS query
+// still joins terms with OR for recall, but the score is proportional to
+// how many query terms actually match instead of a flat presence bonus.
 export function hybridSearch(params: {
   safeQuery: string | null;
   queryEmbedding: Float32Array | null;
@@ -681,28 +745,31 @@ export function hybridSearch(params: {
 }): HybridResult[] {
   const k = params.limit || 10;
   const fetchK = k * 3;
-  // Use composite key "exp:ID" or "pref:ID" — score = cosine similarity (1 - distance)
-  const scores = new Map<string, number>();
+  // Per-channel signals keyed by "exp:ID" or "pref:ID"
+  const vecScores = new Map<string, number>();
+  const ftsScores = new Map<string, number>();
 
   // 1. FTS5 search (experiences only — preferences don't have FTS)
   if (params.safeQuery) {
+    const terms = params.safeQuery
+      .split(" OR ")
+      .map((t) => t.toLowerCase())
+      .filter((t) => t.length > 0);
     try {
       const ftsResults = params.project
-        ? searchExperiencesCompactByProject.all({
+        ? searchExperiencesScoredByProject.all({
             query: params.safeQuery,
             project: params.project,
             limit: fetchK,
           }) as any[]
-        : searchExperiencesCompact.all({
+        : searchExperiencesScored.all({
             query: params.safeQuery,
             limit: fetchK,
           }) as any[];
-      // FTS results get a fixed bonus (0.3) since we don't have cosine distance for them
-      ftsResults.forEach((r: any, i: number) => {
-        const key = `exp:${r.id}`;
-        const ftsBonus = 0.3 * (1.0 / (1 + i * 0.2)); // decreasing bonus by rank
-        scores.set(key, (scores.get(key) || 0) + ftsBonus);
-      });
+      for (const r of ftsResults) {
+        const matched = terms.filter((t) => (r.haystack || "").includes(t)).length;
+        ftsScores.set(`exp:${r.id}`, computeFtsScore(r.bm25_score, matched, terms.length));
+      }
     } catch {
       // FTS5 query failed, continue with vector-only
     }
@@ -719,8 +786,8 @@ export function hybridSearch(params: {
           if (exp && exp.project !== params.project && exp.project !== "") return;
         }
         const key = `exp:${id}`;
-        const similarity = 1.0 - r.distance; // cosine distance → similarity
-        scores.set(key, Math.max(scores.get(key) || 0, similarity));
+        const similarity = clampSimilarity(1.0 - r.distance); // cosine distance → similarity
+        vecScores.set(key, Math.max(vecScores.get(key) || 0, similarity));
       });
     } catch {
       // Vector search failed (empty table or other issue)
@@ -733,19 +800,24 @@ export function hybridSearch(params: {
       const prefResults = searchPrefVectorKNN.all(params.queryEmbedding, fetchK) as any[];
       prefResults.forEach((r: any) => {
         const key = `pref:${r.preference_id}`;
-        const similarity = 1.0 - r.distance;
-        scores.set(key, Math.max(scores.get(key) || 0, similarity));
+        const similarity = clampSimilarity(1.0 - r.distance);
+        vecScores.set(key, Math.max(vecScores.get(key) || 0, similarity));
       });
     } catch {
       // Preference vector search failed
     }
   }
 
-  // 4. Sort by score (highest similarity first), return top K
-  return [...scores.entries()]
-    .sort((a, b) => b[1] - a[1])
+  // 4. Fuse channels into an absolute score, sort, return top K
+  const keys = new Set<string>([...vecScores.keys(), ...ftsScores.keys()]);
+  return [...keys]
+    .map((key) => ({
+      key,
+      score: fuseScores(vecScores.get(key) || 0, ftsScores.get(key) || 0),
+    }))
+    .sort((a, b) => b.score - a.score)
     .slice(0, k)
-    .map(([key, score]) => {
+    .map(({ key, score }) => {
       const [source, idStr] = key.split(":");
       return { id: Number(idStr), score, source: source as "experience" | "preference" };
     });

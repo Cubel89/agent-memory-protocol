@@ -4,7 +4,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-import {
+import db, {
   insertOrDeduplicate,
   searchExperiences,
   searchExperiencesByProject,
@@ -31,18 +31,53 @@ import {
   sanitizeFtsQuery,
   hybridSearch,
   getPreferenceById,
+  invalidatePreference,
+  upsertPrefVector,
+  vectorsAvailable,
 } from "./database.js";
+
+import {
+  PREF_SIMILARITY_THRESHOLD,
+  preferenceEmbeddingText,
+  findMostSimilarPreference,
+  mergeIntoExistingPreference,
+} from "./preference-dedupe.js";
 
 import { getEmbedding, preloadModel } from "./embeddings.js";
 import { startSocketServer } from "./socket-server.js";
 import { normalizeTextPaths } from "./paths.js";
+import {
+  applyPreferenceOptions,
+  formatPreferencesOutput,
+  formatExperienceDetail,
+  formatTimeline,
+  formatMemoryBatch,
+  GET_MEMORY_MAX_IDS,
+  PREFS_DEFAULT_LIMIT,
+  PREFS_DEFAULT_MIN_CONFIDENCE,
+} from "./context-format.js";
+
+import {
+  recordTelemetry,
+  summarizeTelemetry,
+  formatTelemetrySummary,
+} from "./telemetry.js";
 
 // ── MCP Server ──────────────────────────────────────────
 
-const server = new McpServer({
-  name: "agent-memory",
-  version: "1.0.0",
-});
+const server = new McpServer(
+  {
+    name: "agent-memory",
+    version: "3.0.0",
+  },
+  {
+    instructions:
+      "Persistent memory across sessions. Workflow: query_memory returns a compact index of matches; " +
+      "call get_memory(ids) for full detail. get_preferences is bounded by default — use key= for one " +
+      "full value or all=true for everything. Write back: record_experience for task outcomes, " +
+      "record_correction when the user corrects you, learn_preference for stable habits.",
+  }
+);
 
 // ════════════════════════════════════════════════════════
 // TOOL 1: record_experience
@@ -52,16 +87,16 @@ server.registerTool(
   "record_experience",
   {
     description:
-      "Save an experience to the agent's memory. Use this to remember what worked, what failed, and in what context. Each experience enriches the collective memory.",
+      "Save an experience to memory: what was happening, what was done, and the outcome.",
     inputSchema: {
       context: z.string().describe("What was happening (the problem or situation)"),
       action: z.string().describe("What was done to resolve it"),
       result: z.string().describe("What happened after the action"),
       success: z.boolean().describe("Did it work? true/false"),
       tags: z.string().optional().describe("Comma-separated tags (e.g. 'typescript,bug,api')"),
-      project: z.string().optional().describe("Project name or path. If omitted, saved as a global experience."),
-      topic_key: z.string().optional().describe("A unique topic identifier (e.g. 'arch:database-schema', 'config:tsconfig'). If provided, updates the existing experience with the same topic_key+project instead of creating a new one. Use this for knowledge that evolves over time (architecture decisions, configurations, project conventions)."),
-      type: z.enum(["experience", "decision", "gotcha", "discovery"]).optional().describe("Type of experience: 'experience' (default, general technical), 'decision' (architecture/design decision), 'gotcha' (pitfall/trap to avoid), 'discovery' (research finding or relevant data)"),
+      project: z.string().optional().describe("Project name or path. If omitted, saved as global."),
+      topic_key: z.string().optional().describe("Stable topic id (e.g. 'arch:database-schema'). Updates the experience with the same topic_key+project in place — use for knowledge that evolves over time."),
+      type: z.enum(["experience", "decision", "gotcha", "discovery"]).optional().describe("'experience' (default), 'decision' (architecture/design), 'gotcha' (pitfall to avoid), 'discovery' (research finding)"),
     },
   },
   async ({ context, action, result, success, tags, project, topic_key, type }) => {
@@ -101,12 +136,12 @@ server.registerTool(
   "record_correction",
   {
     description:
-      "Record when the user corrects or rejects an action. This is CRITICAL for learning their preferences. Use it whenever the user says 'no', 'not like that', 'do it differently', or rejects a tool call.",
+      "Record a user correction or rejection — call it whenever the user says 'no', 'not like that', or rejects an action.",
     inputSchema: {
       what_i_did: z.string().describe("What you did that was incorrect or rejected"),
       what_user_wanted: z.string().describe("What the user actually wanted"),
-      lesson: z.string().describe("Lesson learned: what to do differently next time"),
-      tags: z.string().optional().describe("Tags to categorize (e.g. 'style,code,communication')"),
+      lesson: z.string().describe("Lesson: what to do differently next time"),
+      tags: z.string().optional().describe("Tags (e.g. 'style,code,communication')"),
       project: z.string().optional().describe("Project where the correction happened"),
     },
   },
@@ -149,25 +184,65 @@ server.registerTool(
   "learn_preference",
   {
     description:
-      "Save or update a user preference. Supports TWO levels:\n" +
-      "- scope='global' (default): applies to ALL projects\n" +
-      "- scope='project-name': applies ONLY to that project and overrides the global\n\n" +
-      "Example: user prefers TypeScript globally, but uses JavaScript in a legacy project.\n" +
-      "Each time the same preference is confirmed, its confidence increases.",
+      "Save or update a user preference. scope='global' (default) applies everywhere; scope='<project>' overrides the global for that project. Re-confirming raises confidence.",
     inputSchema: {
-      key: z.string().describe("Preference name (e.g. 'language', 'code_style', 'framework')"),
-      value: z.string().describe("Preference value (e.g. 'english', 'functional', 'react')"),
-      scope: z.string().optional().describe("'global' (default) or project name/path for project-specific preference"),
-      source: z.string().optional().describe("Where it was learned from (e.g. 'user said so', 'inferred from correction')"),
+      key: z.string().describe("Preference name (e.g. 'language', 'code_style')"),
+      value: z.string().describe("Preference value (e.g. 'english', 'functional')"),
+      scope: z.string().optional().describe("'global' (default) or a project name/path"),
+      source: z.string().optional().describe("Where it was learned (e.g. 'user said so')"),
     },
   },
   async ({ key, value, scope, source }) => {
     const effectiveScope = scope || "global";
 
-    // Normalizar paths absolutos del sandbox para portabilidad entre máquinas.
+    // Normalize absolute sandbox paths for portability across machines.
     const valueNorm = normalizeTextPaths(value);
     const sourceNorm = normalizeTextPaths(source || "observed");
     const scopeNorm = normalizeTextPaths(effectiveScope);
+    const scopeLabel = effectiveScope === "global" ? "GLOBAL" : `project: ${effectiveScope}`;
+
+    // Candidate embedding, computed once and reused for dedupe + storage
+    let embedding: Float32Array | null = null;
+    if (vectorsAvailable) {
+      try {
+        embedding = await getEmbedding(preferenceEmbeddingText(key, valueNorm));
+      } catch { /* embedding failed, continue without it */ }
+    }
+
+    // Semantic dedupe on write: when the key is NEW for this scope but the
+    // value is near-identical to an existing preference, merge into it
+    // instead of creating a duplicate key. Same key = normal upsert.
+    const sameKeyPref = getPreference.get({ key, scope: scopeNorm }) as any;
+    if (!sameKeyPref && embedding) {
+      const match = findMostSimilarPreference(db, {
+        scope: scopeNorm,
+        excludeKey: key,
+        embedding,
+      });
+
+      if (match && match.similarity > PREF_SIMILARITY_THRESHOLD) {
+        const merged = mergeIntoExistingPreference(db, { id: match.id, newValue: valueNorm });
+        // Value changed (new one was more complete): refresh the stored vector
+        if (merged.valueUpdated) {
+          try {
+            const newEmbedding = await getEmbedding(preferenceEmbeddingText(merged.key, merged.value));
+            if (newEmbedding) upsertPrefVector(match.id, newEmbedding);
+          } catch { /* embedding failed, continue without it */ }
+        }
+        checkpoint();
+
+        const updated = getPreferenceById.get({ id: match.id }) as any;
+        const withDecay = applyDecay(updated);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Preference "${key}" merged into existing preference '${merged.key}' (similarity ${match.similarity.toFixed(2)}) [${scopeLabel}]. Value ${merged.valueUpdated ? "updated to the more complete one" : "kept"} (confidence: ${updated?.confidence}, effective: ${withDecay.effective_confidence}).`,
+            },
+          ],
+        };
+      }
+    }
 
     upsertPreference.run({
       key,
@@ -178,23 +253,16 @@ server.registerTool(
     });
     checkpoint();
 
-    const pref = getPreference.get({ key, scope: effectiveScope }) as any;
+    const pref = getPreference.get({ key, scope: scopeNorm }) as any;
 
-    // Generar embedding para la preferencia (si vectores disponibles)
-    if (pref) {
+    // Store the embedding for the saved preference (if vectors available)
+    if (pref && embedding) {
       try {
-        const { upsertPrefVector, vectorsAvailable } = await import("./database.js");
-        if (vectorsAvailable) {
-          const keyWords = key.replace(/_/g, " ");
-          const embeddingText = `user preference ${keyWords}: ${value}`;
-          const embedding = await getEmbedding(embeddingText);
-          if (embedding) upsertPrefVector(pref.id, embedding);
-        }
-      } catch { /* fallo de embedding, continuar sin él */ }
+        upsertPrefVector(pref.id, embedding);
+      } catch { /* vector store failed, continue without it */ }
     }
 
     const withDecay = applyDecay(pref);
-    const scopeLabel = effectiveScope === "global" ? "GLOBAL" : `project: ${effectiveScope}`;
 
     return {
       content: [
@@ -216,10 +284,10 @@ server.registerTool(
   "query_memory",
   {
     description:
-      "Search the memory for relevant experiences. USE THIS BEFORE making important decisions to check if past experiences apply. Full-text search.",
+      "Hybrid (keyword + semantic) search over stored memories. Returns a compact index; call get_memory(ids) for full details. Use before significant decisions.",
     inputSchema: {
-      query: z.string().describe("What to search for (free text, e.g. 'error typescript imports')"),
-      project: z.string().optional().describe("If provided, searches experiences from this project + global ones"),
+      query: z.string().describe("What to search for (free text)"),
+      project: z.string().optional().describe("Search this project's experiences + global ones"),
       limit: z.number().optional().describe("Maximum results (default: 8)"),
     },
   },
@@ -254,7 +322,8 @@ server.registerTool(
         .map((r, i) => {
           if (r.source === "preference") {
             const pref = getPreferenceById.get({ id: r.id }) as any;
-            if (!pref) return null;
+            // Invalidated preferences are hidden from automatic retrieval
+            if (!pref || pref.invalidated_at) return null;
             return `${i + 1}. [preference] ${pref.key}: "${pref.value}" [${pref.scope}] (confidence: ${pref.confidence})`;
           } else {
             const exp = getExperienceById.get({ id: r.id }) as any;
@@ -269,7 +338,7 @@ server.registerTool(
         content: [
           {
             type: "text" as const,
-            text: `Found ${hybridResults.length} results (hybrid search):\n\n${formatted}\n\nUse get_experience(id) for experience details.`,
+            text: `Found ${hybridResults.length} results (hybrid search):\n\n${formatted}\n\nUse get_memory(ids) for full details.`,
           },
         ],
       };
@@ -316,130 +385,128 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 5: get_patterns
-// ════════════════════════════════════════════════════════
-
-server.registerTool(
-  "get_patterns",
-  {
-    description:
-      "Returns the most frequent patterns detected. Useful for seeing recurring errors, successful workflows, and repeatedly learned lessons.",
-    inputSchema: {
-      limit: z.number().optional().describe("Maximum patterns (default: 10)"),
-    },
-  },
-  async ({ limit }) => {
-    const results = getPatterns.all({ limit: limit || 10 }) as any[];
-
-    if (results.length === 0) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "No patterns detected yet. They will form with usage.",
-          },
-        ],
-      };
-    }
-
-    const formatted = results
-      .map(
-        (p: any, i: number) =>
-          `${i + 1}. [x${p.frequency}] ${p.description}\n   Category: ${p.category} | Last seen: ${p.last_seen}`
-      )
-      .join("\n\n");
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `${results.length} patterns detected:\n\n${formatted}`,
-        },
-      ],
-    };
-  }
-);
-
-// ════════════════════════════════════════════════════════
-// TOOL 6: get_preferences
+// TOOL 5: get_preferences
 // Phase 6: Shows effective_confidence with decay
+// v3: patterns/timeline tools were folded into memory_stats/get_memory
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "get_preferences",
   {
     description:
-      "Returns user preferences. If a project is provided, returns global + project-specific preferences combined (project takes priority over global). Check this at the start of each session.",
+      "List user preferences (project overrides merged over global), bounded by default. Use key= for one full preference or all=true for everything. Check at session start.",
     inputSchema: {
-      project: z.string().optional().describe("Project name/path. If omitted, returns only global preferences."),
+      project: z.string().optional().describe("Project name/path. If omitted, global only."),
+      key: z.string().optional().describe("Return ONLY this preference at full length."),
+      all: z.boolean().optional().describe("If true, return every preference unbounded."),
+      limit: z.number().optional().describe(`Maximum preferences (default: ${PREFS_DEFAULT_LIMIT}).`),
+      min_confidence: z.number().optional().describe(`Minimum effective confidence (default: ${PREFS_DEFAULT_MIN_CONFIDENCE}).`),
     },
   },
-  async ({ project }) => {
-    const results = project
-      ? getMergedPreferences(project)
-      : (getGlobalPreferences.all() as any[]).map(applyDecay);
+  async ({ project, key, all, limit, min_confidence }) => {
+    // Telemetry: record the size of whatever this tool returns
+    const respond = (text: string, items: number) => {
+      recordTelemetry(db, { channel: "get_preferences", project: project || "", chars: text.length, items });
+      return { content: [{ type: "text" as const, text }] };
+    };
 
-    if (results.length === 0) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: "No preferences saved yet. They will be learned with usage.",
-          },
-        ],
-      };
+    // Single-key lookup: full value, project scope first, then global
+    if (key) {
+      const found: any[] = [];
+      if (project) {
+        const p = getPreference.get({ key, scope: project }) as any;
+        if (p) found.push({ ...applyDecay(p), _origin: "project" });
+      }
+      const g = getPreference.get({ key, scope: "global" }) as any;
+      if (g) found.push({ ...applyDecay(g), _origin: "global" });
+
+      if (found.length === 0) {
+        return respond(
+          `Preference "${key}" not found${project ? ` (checked project "${project}" and global)` : " (global scope)"}.`,
+          0
+        );
+      }
+
+      const formatted = found
+        .map((p: any) => {
+          const invalidated = p.invalidated_at
+            ? ` [INVALIDATED${p.superseded_by ? ` — superseded by '${p.superseded_by}'` : ""}]`
+            : "";
+          return `- ${p.key} [${p._origin}]: "${p.value}" (confidence: ${p.confidence}, effective: ${p.effective_confidence})${invalidated}`;
+        })
+        .join("\n");
+
+      return respond(formatted, found.length);
     }
 
-    const formatted = results
-      .map(
-        (p: any) => {
-          const origin = p._origin ? ` [${p._origin}]` : ` [${p.scope || "global"}]`;
-          return `- ${p.key}: "${p.value}" (confidence: ${p.confidence}, effective: ${p.effective_confidence}, decay: ${p.decay_factor})${origin}`;
-        }
-      )
-      .join("\n");
+    const allPrefs = project
+      ? getMergedPreferences(project)
+      : (getGlobalPreferences.all() as any[])
+          .map(applyDecay)
+          .sort((a: any, b: any) => b.effective_confidence - a.effective_confidence);
+
+    if (allPrefs.length === 0) {
+      return respond("No preferences saved yet. They will be learned with usage.", 0);
+    }
 
     const label = project ? `Preferences for ${project} (global + project)` : "Global preferences";
 
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `${label}:\n\n${formatted}`,
-        },
-      ],
-    };
+    // Explicit escape: full dump with complete values and metadata
+    if (all) {
+      const formatted = allPrefs
+        .map((p: any) => {
+          const origin = p._origin ? ` [${p._origin}]` : ` [${p.scope || "global"}]`;
+          return `- ${p.key}: "${p.value}" (confidence: ${p.confidence}, effective: ${p.effective_confidence}, decay: ${p.decay_factor})${origin}`;
+        })
+        .join("\n");
+
+      return respond(`${label} (all ${allPrefs.length}):\n\n${formatted}`, allPrefs.length);
+    }
+
+    // Default: bounded output (limit + min confidence + hard char budget)
+    const selected = applyPreferenceOptions(allPrefs, {
+      limit: limit ?? PREFS_DEFAULT_LIMIT,
+      minEffectiveConfidence: min_confidence ?? PREFS_DEFAULT_MIN_CONFIDENCE,
+    });
+
+    return respond(
+      formatPreferencesOutput({ label, prefs: selected, totalCount: allPrefs.length }),
+      selected.length
+    );
   }
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 7: forget_memory (Phase 1: soft delete)
+// TOOL 6: forget_memory (Phase 1: soft delete)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "forget_memory",
   {
     description:
-      "Delete specific memories by id, tag, or project. Useful for cleaning up obsolete or incorrect experiences. Requires at least one parameter.",
+      "Soft-delete experiences by id, tag, or project, and/or invalidate a preference (reversible). Requires at least one parameter.",
     inputSchema: {
       id: z.number().optional().describe("ID of the experience to delete"),
       tag: z.string().optional().describe("Delete all experiences containing this tag"),
       project: z.string().optional().describe("Delete all experiences from this project"),
+      preference_key: z.string().optional().describe("Invalidate this preference (reversible: re-learn it to restore)"),
+      preference_scope: z.string().optional().describe("Scope of the preference (default: 'global')"),
     },
   },
-  async ({ id, tag, project }) => {
-    if (!id && !tag && !project) {
+  async ({ id, tag, project, preference_key, preference_scope }) => {
+    if (!id && !tag && !project && !preference_key) {
       return {
         content: [
           {
             type: "text" as const,
-            text: "Error: you must provide at least one of: id, tag, or project.",
+            text: "Error: you must provide at least one of: id, tag, project, or preference_key.",
           },
         ],
       };
     }
 
     let totalDeleted = 0;
+    let prefInvalidated = false;
 
     if (id) {
       const result = softDeleteExperienceById.run({ id });
@@ -456,14 +523,23 @@ server.registerTool(
       totalDeleted += result.changes;
     }
 
-    if (totalDeleted > 0) checkpoint();
+    if (preference_key) {
+      prefInvalidated = invalidatePreference(preference_key, preference_scope || "global");
+    }
+
+    if (totalDeleted > 0 || prefInvalidated) checkpoint();
 
     const stats = getStats();
+    const prefNote = preference_key
+      ? prefInvalidated
+        ? ` Preference '${preference_key}' invalidated [${preference_scope || "global"}] (reversible: re-learn it to restore).`
+        : ` Preference '${preference_key}' not found or already invalidated [${preference_scope || "global"}].`
+      : "";
     return {
       content: [
         {
           type: "text" as const,
-          text: `Soft-deleted ${totalDeleted} experience(s). Active memory: ${stats.experiences} experiences, ${stats.softDeleted} soft-deleted, ${stats.patterns} patterns.`,
+          text: `Soft-deleted ${totalDeleted} experience(s).${prefNote} Active memory: ${stats.experiences} experiences, ${stats.softDeleted} soft-deleted, ${stats.patterns} patterns.`,
         },
       ],
     };
@@ -471,14 +547,14 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 8: prune_memory (Phase 1: soft delete)
+// TOOL 7: prune_memory (Phase 1: soft delete)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "prune_memory",
   {
     description:
-      "Automatic memory cleanup. Deletes old experiences (by days), failures only, or low-confidence preferences. Requires at least one parameter.",
+      "Bulk cleanup: soft-delete experiences older than N days (optionally failures only) and/or delete low-confidence preferences.",
     inputSchema: {
       older_than_days: z.number().optional().describe("Delete experiences older than N days"),
       only_failures: z.boolean().optional().describe("If true, only delete failed experiences (default: false)"),
@@ -536,16 +612,20 @@ server.registerTool(
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 9: memory_stats (Phase 1: includes soft-deleted)
+// TOOL 8: memory_stats (v3: + telemetry summary + include)
+// Absorbs the old get_patterns tool via include=["patterns"]
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
   "memory_stats",
   {
-    description: "Shows memory statistics: experiences, corrections, global/project preferences, and patterns.",
-    inputSchema: {},
+    description:
+      "Memory statistics plus retrieval telemetry (avg/p95 chars per channel, last 30 days). include=['patterns'] adds the full detected-patterns list.",
+    inputSchema: {
+      include: z.array(z.enum(["patterns"])).optional().describe("Extra sections: 'patterns' (full list, up to 20)"),
+    },
   },
-  async () => {
+  async ({ include }) => {
     const stats = getStats();
     const corrections = getExperiencesByType.all({ type: "correction", limit: 3 }) as any[];
     const topPatterns = getPatterns.all({ limit: 3 }) as any[];
@@ -565,12 +645,24 @@ Patterns:           ${stats.patterns}`;
       });
     }
 
-    if (topPatterns.length > 0) {
+    if (include?.includes("patterns")) {
+      const fullPatterns = getPatterns.all({ limit: 20 }) as any[];
+      text += `\n\nPatterns (${fullPatterns.length}):`;
+      if (fullPatterns.length === 0) {
+        text += `\n(none detected yet — they will form with usage)`;
+      }
+      fullPatterns.forEach((p: any) => {
+        text += `\n- [x${p.frequency}] ${p.description}\n  Category: ${p.category} | Last seen: ${p.last_seen}`;
+      });
+    } else if (topPatterns.length > 0) {
       text += `\n\nTop patterns:`;
       topPatterns.forEach((p: any) => {
         text += `\n- [x${p.frequency}] ${p.description}`;
       });
     }
+
+    // Retrieval telemetry: how much each channel returns (chars/tokens)
+    text += `\n\n${formatTelemetrySummary(summarizeTelemetry(db))}`;
 
     return {
       content: [{ type: "text" as const, text }],
@@ -579,95 +671,47 @@ Patterns:           ${stats.patterns}`;
 );
 
 // ════════════════════════════════════════════════════════
-// TOOL 10: get_experience (Phase 5: Progressive Disclosure)
+// TOOL 9: get_memory (v3: batch detail, replaces
+// get_experience and get_timeline)
 // ════════════════════════════════════════════════════════
 
 server.registerTool(
-  "get_experience",
+  "get_memory",
   {
     description:
-      "Get full details of a specific experience by ID. Use this after query_memory returns compact results to drill into a specific experience.",
+      "Fetch full details for one or more memories by id (batch). Set timeline=true to also list events within +-1 hour of each experience.",
     inputSchema: {
-      id: z.number().describe("The experience ID to retrieve"),
+      ids: z.array(z.number()).min(1).describe(`Experience ids from query_memory (max ${GET_MEMORY_MAX_IDS})`),
+      timeline: z.boolean().optional().describe("Include the +-1 hour timeline around each experience"),
     },
   },
-  async ({ id }) => {
-    const exp = getExperienceById.get({ id }) as any;
+  async ({ ids, timeline }) => {
+    const requested = ids.slice(0, GET_MEMORY_MAX_IDS);
+    const blocks: string[] = [];
+    const missingIds: number[] = [];
 
-    if (!exp) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `Experience #${id} not found (may have been deleted).`,
-          },
-        ],
-      };
+    for (const id of requested) {
+      const exp = getExperienceById.get({ id }) as any;
+      if (!exp) {
+        missingIds.push(id);
+        continue;
+      }
+      let block = formatExperienceDetail(exp);
+      if (timeline) {
+        const rows = getExperienceTimeline.all({ id }) as any[];
+        const tl = formatTimeline(rows, id);
+        if (tl) block += `\n\n${tl}`;
+      }
+      blocks.push(block);
+    }
+
+    let text = formatMemoryBatch({ blocks, missingIds });
+    if (ids.length > GET_MEMORY_MAX_IDS) {
+      text += `\n\n(${ids.length - GET_MEMORY_MAX_IDS} ids beyond the ${GET_MEMORY_MAX_IDS}-id cap were ignored)`;
     }
 
     return {
-      content: [
-        {
-          type: "text" as const,
-          text: `=== Experience #${exp.id} ===
-Type:       ${exp.type}
-Success:    ${exp.success ? "Yes" : "No"}
-Project:    ${exp.project || "(global)"}
-Tags:       ${exp.tags || "(none)"}
-Created:    ${exp.created_at}
-${exp.topic_key ? `Topic:      ${exp.topic_key}\n` : ""}${exp.revision_count > 1 ? `Revisions:  ${exp.revision_count}\n` : ""}${exp.duplicate_count > 1 ? `Duplicates: ${exp.duplicate_count}\n` : ""}
-Context:    ${exp.context}
-Action:     ${exp.action}
-Result:     ${exp.result}`,
-        },
-      ],
-    };
-  }
-);
-
-// ════════════════════════════════════════════════════════
-// TOOL 11: get_timeline (Phase 5: Progressive Disclosure)
-// ════════════════════════════════════════════════════════
-
-server.registerTool(
-  "get_timeline",
-  {
-    description:
-      "Get chronological context around a specific experience. Shows what happened before and after within a 1-hour window. Useful for understanding the sequence of events.",
-    inputSchema: {
-      id: z.number().describe("The experience ID to get timeline around"),
-    },
-  },
-  async ({ id }) => {
-    const results = getExperienceTimeline.all({ id }) as any[];
-
-    if (results.length === 0) {
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: `No timeline found for experience #${id} (may have been deleted).`,
-          },
-        ],
-      };
-    }
-
-    const formatted = results
-      .map(
-        (r: any) => {
-          const marker = r.id === id ? " <<<" : "";
-          return `[${r.created_at}] #${r.id} [${r.type}] ${r.success ? "OK" : "FAIL"} | ${r.snippet}${marker}`;
-        }
-      )
-      .join("\n");
-
-    return {
-      content: [
-        {
-          type: "text" as const,
-          text: `Timeline around experience #${id} (+-1 hour):\n\n${formatted}`,
-        },
-      ],
+      content: [{ type: "text" as const, text }],
     };
   }
 );
@@ -675,8 +719,8 @@ server.registerTool(
 // ── Start the server ────────────────────────────────────
 
 async function main() {
-  // Lazy loading: el modelo de embeddings se carga en la primera query, no al arrancar
-  // preloadModel() eliminado para arranque instantáneo
+  // Lazy loading: the embedding model loads on the first query, not at startup
+  // (preloadModel() removed for instant startup)
 
   // Start Unix socket server for hooks
   startSocketServer();
@@ -684,7 +728,7 @@ async function main() {
   // Start MCP server
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Agent Memory MCP Server v2.0.0 running on stdio");
+  console.error("Agent Memory MCP Server v3.0.0 running on stdio");
 }
 
 main().catch((error) => {

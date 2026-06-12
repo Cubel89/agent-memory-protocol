@@ -2,6 +2,8 @@ import { describe, it, expect, beforeEach } from "vitest";
 import Database from "better-sqlite3";
 import type BetterSqlite3 from "better-sqlite3";
 import { createHash } from "crypto";
+import { applyPreferenceOptions, type PreferenceOptions } from "../src/context-format";
+import { computeDecayFactor } from "../src/scoring";
 
 // ── Helpers ─────────────────────────────────────────────
 
@@ -12,17 +14,6 @@ function normalizeText(text: string): string {
 function computeHash(context: string, action: string, result: string): string {
   const normalized = normalizeText(`${context}|${action}|${result}`);
   return createHash("sha256").update(normalized).digest("hex");
-}
-
-function computeDecayFactor(lastConfirmedAt: string | null): number {
-  if (!lastConfirmedAt) return 0.5;
-  const now = Date.now();
-  const confirmed = new Date(lastConfirmedAt + "Z").getTime();
-  const daysSince = (now - confirmed) / (1000 * 60 * 60 * 24);
-  if (daysSince <= 30) return 1.0;
-  if (daysSince <= 90) return 0.9;
-  if (daysSince <= 180) return 0.7;
-  return 0.5;
 }
 
 // Helper: creates an in-memory DB with the full v1.0.0 schema
@@ -318,18 +309,19 @@ function prepareQueries(db: BetterSqlite3.Database) {
     return { id: Number(info.lastInsertRowid), deduplicated: false };
   }
 
-  function getMergedPreferences(project: string) {
+  function getMergedPreferences(project: string, options?: PreferenceOptions) {
     const global = getGlobalPreferences.all() as any[];
     const projectPrefs = getProjectPreferences.all({ scope: project }) as any[];
     const merged = new Map<string, any>();
     for (const pref of global) merged.set(pref.key, { ...pref, _origin: "global" });
     for (const pref of projectPrefs) merged.set(pref.key, { ...pref, _origin: "project" });
-    return Array.from(merged.values())
+    const sorted = Array.from(merged.values())
       .map((p) => {
         const decay = computeDecayFactor(p.last_confirmed_at);
         return { ...p, effective_confidence: Math.round(p.confidence * decay * 100) / 100, decay_factor: decay };
       })
       .sort((a, b) => b.effective_confidence - a.effective_confidence);
+    return applyPreferenceOptions(sorted, options);
   }
 
   function recordPattern(description: string, category: string, example: string) {
@@ -482,6 +474,38 @@ describe("preferences", () => {
     const fw = merged.find((p: any) => p.key === "framework");
     expect(fw.value).toBe("vue");
     expect(fw._origin).toBe("project");
+  });
+
+  it("getMergedPreferences without options returns everything (backwards compatible)", () => {
+    for (let i = 0; i < 6; i++) {
+      q.upsertPreference.run({ key: `pref_${i}`, value: `v${i}`, confidence: 0.3, source: "test", scope: "global" });
+    }
+    expect(q.getMergedPreferences("any-project")).toHaveLength(6);
+  });
+
+  it("getMergedPreferences applies limit after merge+decay+sort", () => {
+    for (let i = 0; i < 6; i++) {
+      q.upsertPreference.run({ key: `pref_${i}`, value: `v${i}`, confidence: 0.3, source: "test", scope: "global" });
+    }
+    // Confirm one pref twice so it has higher confidence and sorts first
+    q.upsertPreference.run({ key: "pref_3", value: "v3", confidence: 0.3, source: "test", scope: "global" });
+
+    const limited = q.getMergedPreferences("any-project", { limit: 3 });
+    expect(limited).toHaveLength(3);
+    expect(limited[0].key).toBe("pref_3");
+  });
+
+  it("getMergedPreferences filters by minimum effective confidence", () => {
+    q.upsertPreference.run({ key: "low", value: "v", confidence: 0.3, source: "test", scope: "global" });
+    q.upsertPreference.run({ key: "high", value: "v", confidence: 0.3, source: "test", scope: "global" });
+    // Confirm "high" several times: 0.3 → 0.4 → 0.5 → 0.6
+    q.upsertPreference.run({ key: "high", value: "v", confidence: 0.3, source: "test", scope: "global" });
+    q.upsertPreference.run({ key: "high", value: "v", confidence: 0.3, source: "test", scope: "global" });
+    q.upsertPreference.run({ key: "high", value: "v", confidence: 0.3, source: "test", scope: "global" });
+
+    const filtered = q.getMergedPreferences("any-project", { minEffectiveConfidence: 0.5 });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0].key).toBe("high");
   });
 });
 
@@ -953,7 +977,13 @@ describe("temporal decay (Phase 6)", () => {
     const twoHundredDaysAgo = new Date(Date.now() - 200 * 24 * 60 * 60 * 1000).toISOString().replace("Z", "");
     expect(computeDecayFactor(twoHundredDaysAgo)).toBe(0.5);
 
-    // Null: 0.5 decay
+    // No floor (retrieval v3): 400 days -> 0.3, 800 days -> 0.15
+    const fourHundredDaysAgo = new Date(Date.now() - 400 * 24 * 60 * 60 * 1000).toISOString().replace("Z", "");
+    expect(computeDecayFactor(fourHundredDaysAgo)).toBe(0.3);
+    const eightHundredDaysAgo = new Date(Date.now() - 800 * 24 * 60 * 60 * 1000).toISOString().replace("Z", "");
+    expect(computeDecayFactor(eightHundredDaysAgo)).toBe(0.15);
+
+    // Null: 0.5 decay (unknown age)
     expect(computeDecayFactor(null)).toBe(0.5);
   });
 

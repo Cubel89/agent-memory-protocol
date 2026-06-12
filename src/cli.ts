@@ -1,29 +1,42 @@
 #!/usr/bin/env node
 /**
- * cli.ts - CLI wrapper para agent-memory-protocol
+ * cli.ts - CLI wrapper for agent-memory-protocol
  *
- * Usado por los hooks de Claude Code para registrar experiencias, correcciones,
- * preferencias y capturar contexto de sesión. Usa el mismo database.ts que el MCP.
+ * Used by the Claude Code hooks to record experiences, corrections and
+ * preferences, and to capture session context. Shares database.ts with the
+ * MCP server.
  *
- * Uso:
- *   node cli.js <comando> --param valor ...
- *   echo '{"param": "valor"}' | node cli.js <comando>
+ * Usage:
+ *   node cli.js <command> --param value ...
+ *   echo '{"param": "value"}' | node cli.js <command>
  *
- * Comandos:
- *   auto_capture       Registra uso de herramienta (post-tool-use hook)
- *   get_context        Devuelve additionalContext JSON (session-start hook)
- *   session_summary    Registra resumen de sesión (session-end hook)
+ * Commands:
+ *   auto_capture       Records tool usage (post-tool-use hook)
+ *   get_context        Returns additionalContext JSON (session-start hook)
+ *   session_summary    Records a session summary (session-end hook)
+ *   consolidate        Offline maintenance: dedupe preferences, purge old
+ *                      soft-deleted rows, clean orphans, VACUUM.
+ *                      Dry-run by default; pass --apply to execute.
  */
 
-import {
+import db, {
   insertOrDeduplicate,
   getMergedPreferences,
   getRecentExperiences,
+  getExperiencesByType,
   getPatterns,
+  getStats,
   checkpoint,
 } from "./database.js";
+import { recordTelemetry } from "./telemetry.js";
+import {
+  formatSessionIndex,
+  formatMinimalContext,
+  AUTO_MIN_EFFECTIVE_CONFIDENCE,
+} from "./context-format.js";
+import { runConsolidation, formatConsolidationReport } from "./consolidate.js";
 
-// ── Parseo de argumentos CLI ─────────────────────────────
+// ── CLI argument parsing ────────────────────────────────
 
 function parseArgs(argv: string[]): Record<string, string> {
   const args: Record<string, string> = {};
@@ -39,7 +52,7 @@ function parseArgs(argv: string[]): Record<string, string> {
   return args;
 }
 
-// ── Lectura de stdin si no es TTY ────────────────────────
+// ── Read stdin when not a TTY ───────────────────────────
 
 async function readStdin(): Promise<Record<string, any>> {
   if (process.stdin.isTTY) return {};
@@ -65,12 +78,12 @@ async function main() {
   const cliArgs = parseArgs(process.argv);
   const stdinData = await readStdin();
 
-  // CLI args tienen prioridad sobre stdin
+  // CLI args take priority over stdin
   const params: Record<string, any> = { ...stdinData, ...cliArgs };
 
   switch (command) {
 
-    // Usado por post-tool-use.sh
+    // Used by post-tool-use.sh
     case "auto_capture": {
       const context = params.context || "";
       if (!context) {
@@ -91,51 +104,57 @@ async function main() {
       break;
     }
 
-    // Usado por session-start.sh
+    // Used by session-start.sh (socket-less fallback — same index format)
     case "get_context": {
       const project = params.project || "";
       const source = params.source || "startup";
 
-      const prefs = getMergedPreferences(project);
+      // Automatic output: apply the effective-confidence floor
+      const prefs = getMergedPreferences(project, {
+        minEffectiveConfidence: AUTO_MIN_EFFECTIVE_CONFIDENCE,
+      });
+
+      // After compaction or /clear: minimal reminder, not the full dump
+      if (source === "compact" || source === "clear") {
+        const stats = getStats();
+        const contextText = formatMinimalContext({
+          project,
+          source,
+          prefCount: prefs.length,
+          expCount: stats.experiences,
+        });
+        recordTelemetry(db, { channel: "session_start", project, chars: contextText.length, items: 0 });
+        console.log(JSON.stringify({ additionalContext: contextText }));
+        break;
+      }
+
       const allExp = getRecentExperiences.all({ limit: 20 }) as any[];
       const recentExp = allExp
         .filter((e) => !["auto_capture", "session_summary"].includes(e.type))
         .slice(0, 5);
-      const topPatterns = (getPatterns.all({ limit: 3 }) as any[]);
+      const topPatterns = getPatterns.all({ limit: 3 }) as any[];
+      const corrections = getExperiencesByType.all({ type: "correction", limit: 3 }) as any[];
 
-      const prefLines = prefs
-        .slice(0, 30)
-        .map((p: any) => `- **${p.key}:** ${p.value} (confidence: ${p.effective_confidence ?? p.confidence})`)
-        .join("\n") || "_(ninguna encontrada)_";
-
-      const expLines = recentExp
-        .map((e: any) => `- [${e.type}] ${(e.context || "").substring(0, 120)} (${e.created_at})`)
-        .join("\n") || "_(ninguna encontrada)_";
-
-      const patLines = topPatterns
-        .map((p: any) => `- ${p.description} (freq: ${p.frequency}, cat: ${p.category})`)
-        .join("\n") || "_(ninguna encontrada)_";
-
-      const contextText = [
-        "## Agent Memory Context (auto-injected via hook)",
-        `**Project:** ${project || "(desconocido)"}`,
-        `**Source:** ${source}`,
-        "",
-        `### Preferencias (${prefs.length} cargadas)`,
-        prefLines,
-        "",
-        `### Experiencias recientes (${recentExp.length})`,
-        expLines,
-        "",
-        `### Top Patrones (${topPatterns.length})`,
-        patLines,
-      ].join("\n");
+      const contextText = formatSessionIndex({
+        project,
+        source,
+        prefs,
+        experiences: recentExp,
+        patterns: topPatterns,
+        corrections,
+      });
+      recordTelemetry(db, {
+        channel: "session_start",
+        project,
+        chars: contextText.length,
+        items: prefs.length + recentExp.length + topPatterns.length + corrections.length,
+      });
 
       console.log(JSON.stringify({ additionalContext: contextText }));
       break;
     }
 
-    // Usado por session-end.sh
+    // Used by session-end.sh
     case "session_summary": {
       const project = params.project || "";
       const count = parseInt(params.count || "0", 10);
@@ -156,8 +175,18 @@ async function main() {
       break;
     }
 
+    // Manual/cron maintenance: dedupe + purge + orphan cleanup + VACUUM.
+    // Dry-run by default; --apply executes the changes.
+    case "consolidate": {
+      const apply = params.apply === "true" || params.apply === true;
+      const report = runConsolidation(db, { apply });
+      if (apply) checkpoint();
+      console.log(formatConsolidationReport(report));
+      break;
+    }
+
     default:
-      console.error(JSON.stringify({ ok: false, error: `Comando desconocido: ${command}` }));
+      console.error(JSON.stringify({ ok: false, error: `Unknown command: ${command}` }));
       process.exit(1);
   }
 }
